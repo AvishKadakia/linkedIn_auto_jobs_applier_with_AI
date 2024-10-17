@@ -1,3 +1,5 @@
+data_folder/secrets.yaml
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -158,5 +160,3 @@ venv.bak/
 mono_crash.*
 
 /generated_cv
-data_folder/secrets.yaml
-data_folder/secrets.yaml
