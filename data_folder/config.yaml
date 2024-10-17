@@ -1,45 +1,63 @@
 remote: true
 
 experienceLevel:
-  internship: false
-  entry: true
-  associate: true
-  mid-senior level: true
-  director: false
-  executive: false
+ internship: false
+ entry: false
+ associate: true
+ mid-senior level: true
+ director: true
+ executive: true
 
 jobTypes:
-  full-time: true
-  contract: false
-  part-time: false
-  temporary: true
-  internship: false
-  other: false
-  volunteer: true
+ full-time: true
+ contract: true
+ part-time: true
+ temporary: false
+ internship: false
+ other: false
+ volunteer: false
 
 date:
-  all time: false
-  month: false
-  week: false
-  24 hours: true
+ all time: false
+ month: true
+ week: true
+ 24 hours: true
 
 positions:
-  - Software engineer
+  - senior machine learning engineer
+  - Machine Learning Engineer
+  - ai
+  - Data Science
+  - Data Analyst
+  - Python Developer
+  - High Frequency Trading
+  - Quant Trading
+  - Quant Developer
 
 locations:
-  - Germany
+  - Canada
+  - USA
+  - UAE
+  - Japan
 
 apply_once_at_company: true
 
 distance: 100
 
-company_blacklist:
-  - wayfair
+companyBlacklist:
   - Crossover
-
-title_blacklist:
-  - word1
-  - word2
+  - Lumenalta (formerly Clevertech)
+  - RemoteWorker CA
+  - hackajob
+  - HireMeFast LLC
+  - HireRoad
+  - Dice
+  - YO HR Consultancy
+  - wayfair
+titleBlacklist:
+  - Juniors
+  - Junior
+  - Project Manager
 
 job_applicants_threshold:
   min_applicants: 0
@@ -47,4 +65,3 @@ job_applicants_threshold:
 
 llm_model_type: openai
 llm_model: 'gpt-4o-mini'
-# llm_api_url: 'https://api.pawan.krd/cosmosrp/v1'
