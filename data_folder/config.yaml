@@ -19,7 +19,7 @@ jobTypes:
 
 date:
  all time: false
- month: false
+ month: true
  week: true
  24 hours: true
 
@@ -40,6 +40,8 @@ locations:
   - UAE
   - Japan
 
+apply_once_at_company: true
+
 distance: 100
 
 companyBlacklist:
@@ -51,5 +53,15 @@ companyBlacklist:
   - HireRoad
   - Dice
   - YO HR Consultancy
+  - wayfair
 titleBlacklist:
-  - Juniorss
+  - Juniors
+  - Junior
+  - Project Manager
+
+job_applicants_threshold:
+  min_applicants: 0
+  max_applicants: 30
+
+llm_model_type: openai
+llm_model: 'gpt-4o-mini'

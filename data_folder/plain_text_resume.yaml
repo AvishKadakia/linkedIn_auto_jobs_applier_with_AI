@@ -5,8 +5,9 @@ personal_information:
   country: "Canada"
   city: "Toronto"
   address: "897 College Street Toronto Ontario Canada M6H1A1"
+  zip_code: "M6H 2C2"
   phone_prefix: "+1"
-  phone: "807 358 0441"
+  phone: "8073580441"
   email: "avishkadakia1996@gmail.com"
   github: "https://github.com/AvishKadakia"
   linkedin: "https://www.linkedin.com/in/avish-kadakia-3a6591116/"
@@ -157,7 +158,7 @@ availability:
   notice_period: "2 Weeks"
 
 salary_expectations:
-  salary_range_usd: "140000 - 200000"
+  salary_range_usd: "120000 - 130000"
 
 self_identification:
   gender: "Male"
@@ -175,10 +176,18 @@ legal_authorization:
   legally_allowed_to_work_in_eu: "Yes"
   legally_allowed_to_work_in_us: "Yes"
   requires_eu_sponsorship: "No"
+  canada_work_authorization: "Yes"
+  requires_canada_visa: "No"
+  legally_allowed_to_work_in_canada: "Yes"
+  requires_canada_sponsorship: "No"
+  uk_work_authorization: "No"
+  requires_uk_visa: "Yes"
+  legally_allowed_to_work_in_uk: "No"
+  requires_uk_sponsorship: "Yes"
 
 work_preferences:
   remote_work: "Yes"
-  in_person_work: "No"
+  in_person_work: "Yes"
   open_to_relocation: "Yes"
   willing_to_complete_assessments: "Yes"
   willing_to_undergo_drug_tests: "Yes"

@@ -1,3 +1,5 @@
+data_folder/secrets.yaml
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -52,7 +54,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
-
+virtual/*
+data_folder/*
 # Translations
 *.mo
 *.pot
@@ -157,4 +160,3 @@ venv.bak/
 mono_crash.*
 
 /generated_cv
-data_folder/secrets.yaml
