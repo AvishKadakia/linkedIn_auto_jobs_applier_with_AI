@@ -259,6 +259,24 @@ class AIHawkJobManager:
         except Exception as e:
             logger.error(f"Error while fetching job elements: {e}")
             return []
+    def check_job_title(self,job_title: str) -> bool:
+        # List of keywords to check for
+        keywords = ["senior machine learning engineer", 
+                    "machine learning engineer", 
+                    "ai engineer", 
+                    "python", 
+                    "llm",
+                    "Data science",
+                    "Data Engineer",
+                    "High Frequency Trading",
+                    "Quant Trading",
+                    "Quant Developer"]
+
+        # Normalize the job title to lowercase for case-insensitive comparison
+        job_title_lower = job_title.lower()
+
+        # Check if any of the keywords are present in the job title
+        return any(keyword in job_title_lower for keyword in keywords)
 
     def read_jobs(self):
         try:
@@ -281,7 +299,11 @@ class AIHawkJobManager:
                 self.write_to_file(job, "skipped")
                 continue
             try:
-                self.write_to_file(job,'data')
+                if self.check_job_title(job.title) == True:
+                    self.write_to_file(job,'data')
+                else:
+                    utils.printyellow(f"Job Keyword didn't match {job.title} at {job.company}, skipping...")
+                    self.write_to_file(job, "skipped")
             except Exception as e:
                 self.write_to_file(job, "failed")
                 continue

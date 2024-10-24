@@ -27,18 +27,12 @@ positions:
   - senior machine learning engineer
   - Machine Learning Engineer
   - ai
-  - Data Science
-  - Data Analyst
   - Python Developer
-  - High Frequency Trading
-  - Quant Trading
-  - Quant Developer
+  - llm
 
 locations:
   - Canada
   - USA
-  - UAE
-  - Japan
 
 apply_once_at_company: true
 
@@ -58,6 +52,14 @@ titleBlacklist:
   - Juniors
   - Junior
   - Project Manager
+  - Project
+  - salesforce
+  - customer
+  - netsuite
+  - Product Manager
+  - W2
+  - Director
+  - Writer
 
 job_applicants_threshold:
   min_applicants: 0
