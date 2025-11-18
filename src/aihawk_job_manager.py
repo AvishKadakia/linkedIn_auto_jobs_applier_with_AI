@@ -263,20 +263,26 @@ class AIHawkJobManager:
         # List of keywords to check for
         keywords = ["senior machine learning engineer", 
                     "machine learning engineer", 
-                    "ai engineer", 
+                    "ai engineer",
+                    "AI/ML",
+                    "ML",
+                    "AI", 
                     "python", 
                     "llm",
                     "Data science",
+                    "data scientist"
                     "Data Engineer",
                     "High Frequency Trading",
                     "Quant Trading",
-                    "Quant Developer"]
+                    "Quant Developer",
+                    "Lead ML Engineer",
+                    "Data engineer Python LLM",
+                    "Senior Machine Learning Engineer"]
 
         # Normalize the job title to lowercase for case-insensitive comparison
         job_title_lower = job_title.lower()
-
         # Check if any of the keywords are present in the job title
-        return any(keyword in job_title_lower for keyword in keywords)
+        return any(keyword.lower() in job_title_lower for keyword in keywords)
 
     def read_jobs(self):
         try:
@@ -299,11 +305,7 @@ class AIHawkJobManager:
                 self.write_to_file(job, "skipped")
                 continue
             try:
-                if self.check_job_title(job.title) == True:
-                    self.write_to_file(job,'data')
-                else:
-                    utils.printyellow(f"Job Keyword didn't match {job.title} at {job.company}, skipping...")
-                    self.write_to_file(job, "skipped")
+                self.write_to_file(job,'data')
             except Exception as e:
                 self.write_to_file(job, "failed")
                 continue
@@ -395,9 +397,13 @@ class AIHawkJobManager:
                 continue
             try:
                 if job.apply_method not in {"Continue", "Applied", "Apply"}:
-                    self.easy_applier_component.job_apply(job)
-                    self.write_to_file(job, "success")
-                    logger.debug(f"Applied to job: {job.title} at {job.company}")
+                    if self.check_job_title(job.title) == True:
+                        self.easy_applier_component.job_apply(job)
+                        self.write_to_file(job, "success")
+                        logger.debug(f"Applied to job: {job.title} at {job.company}")
+                    else:
+                        utils.printyellow(f"Job Keyword didn't match {job.title} at {job.company}, skipping...")
+                        self.write_to_file(job, "skipped")
             except Exception as e:
                 logger.error(f"Failed to apply for {job.title} at {job.company}: {e}")
                 self.write_to_file(job, "failed")

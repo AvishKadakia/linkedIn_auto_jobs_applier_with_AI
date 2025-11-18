@@ -1,34 +1,47 @@
 remote: true
 
 experienceLevel:
- internship: false
- entry: false
- associate: true
- mid-senior level: true
- director: true
- executive: true
+  internship: false
+  entry: false
+  associate: false
+  mid-senior level: true
+  director: true
+  executive: false
 
 jobTypes:
- full-time: true
- contract: true
- part-time: true
- temporary: false
- internship: false
- other: false
- volunteer: false
+  full-time: true
+  contract: true
+  part-time: true
+  temporary: false
+  internship: false
+  other: false
+  volunteer: false
 
 date:
- all time: false
- month: true
- week: true
- 24 hours: true
+  all time: false
+  month: true
+  week: true
+  24 hours: true
 
 positions:
-  - senior machine learning engineer
+  - Senior Machine Learning Engineer
+  - Staff Machine Learning Engineer
   - Machine Learning Engineer
-  - ai
-  - Python Developer
-  - llm
+  - Senior AI Engineer
+  - Staff AI Engineer
+  - Senior LLM Engineer
+  - LLM Engineer
+  - Senior Generative AI Engineer
+  - Applied ML Engineer
+  - Applied ML / LLM Engineer
+  - Senior MLOps Engineer
+  - Staff MLOps Engineer
+  - Machine Learning Platform Engineer
+  - Senior ML Platform Engineer
+  - Senior Data Scientist, Machine Learning
+  - Senior Data Scientist, AI
+  - Senior Research Engineer, ML
+  - Senior Applied Scientist, Machine Learning
 
 locations:
   - Canada
@@ -48,6 +61,9 @@ companyBlacklist:
   - Dice
   - YO HR Consultancy
   - wayfair
+  - jobot
+  - Harnham
+
 titleBlacklist:
   - Juniors
   - Junior
@@ -66,4 +82,4 @@ job_applicants_threshold:
   max_applicants: 30
 
 llm_model_type: openai
-llm_model: 'gpt-4o-mini'
+llm_model: 'gpt-5-mini'

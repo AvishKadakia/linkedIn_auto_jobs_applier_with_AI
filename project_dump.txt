@@ -1,0 +1,4175 @@
+#app_config.py
+
+# In this file, you can set the configurations of the app.
+
+"""
+MINIMUM_LOG_LEVEL can only be one of the followings:
+    - "DEBUG"
+    - "INFO"
+    - "WARNING"
+    - "ERROR"
+    - "CRITICAL"
+"""
+MINIMUM_LOG_LEVEL = "DEBUG"
+
+MINIMUM_WAIT_TIME = 15
+
+
+#main.py
+
+import os
+import re
+import sys
+from pathlib import Path
+import yaml
+import click
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import WebDriverException
+from lib_resume_builder_AIHawk import Resume, FacadeManager, ResumeGenerator, StyleManager
+from src.utils import chrome_browser_options
+from src.llm.llm_manager import GPTAnswerer
+from src.aihawk_authenticator import AIHawkAuthenticator
+from src.aihawk_bot_facade import AIHawkBotFacade
+from src.aihawk_job_manager import AIHawkJobManager
+from src.job_application_profile import JobApplicationProfile
+from loguru import logger
+
+# Suppress stderr only during specific operations
+original_stderr = sys.stderr
+
+class ConfigError(Exception):
+    pass
+
+class ConfigValidator:
+    @staticmethod
+    def validate_email(email: str) -> bool:
+        return re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email) is not None
+    
+    @staticmethod
+    def validate_yaml_file(yaml_path: Path) -> dict:
+        try:
+            with open(yaml_path, 'r') as stream:
+                return yaml.safe_load(stream)
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"Error reading file {yaml_path}: {exc}")
+        except FileNotFoundError:
+            raise ConfigError(f"File not found: {yaml_path}")
+
+    @staticmethod
+    def validate_config(config_yaml_path: Path) -> dict:
+        parameters = ConfigValidator.validate_yaml_file(config_yaml_path)
+        required_keys = {
+            'remote': bool,
+            'experienceLevel': dict,
+            'jobTypes': dict,
+            'date': dict,
+            'positions': list,
+            'locations': list,
+            'distance': int,
+            'companyBlacklist': list,
+            'titleBlacklist': list,
+            'llm_model_type': str,
+            'llm_model': str
+        }
+
+        for key, expected_type in required_keys.items():
+            if key not in parameters:
+                if key in ['companyBlacklist', 'titleBlacklist']:
+                    parameters[key] = []
+                else:
+                    raise ConfigError(f"Missing or invalid key '{key}' in config file {config_yaml_path}")
+            elif not isinstance(parameters[key], expected_type):
+                if key in ['companyBlacklist', 'titleBlacklist'] and parameters[key] is None:
+                    parameters[key] = []
+                else:
+                    raise ConfigError(f"Invalid type for key '{key}' in config file {config_yaml_path}. Expected {expected_type}.")
+
+        # Validate experience levels, ensure they are boolean
+        experience_levels = ['internship', 'entry', 'associate', 'mid-senior level', 'director', 'executive']
+        for level in experience_levels:
+            if not isinstance(parameters['experienceLevel'].get(level), bool):
+                raise ConfigError(f"Experience level '{level}' must be a boolean in config file {config_yaml_path}")
+
+        # Validate job types, ensure they are boolean
+        job_types = ['full-time', 'contract', 'part-time', 'temporary', 'internship', 'other', 'volunteer']
+        for job_type in job_types:
+            if not isinstance(parameters['jobTypes'].get(job_type), bool):
+                raise ConfigError(f"Job type '{job_type}' must be a boolean in config file {config_yaml_path}")
+
+        # Validate date filters
+        date_filters = ['all time', 'month', 'week', '24 hours']
+        for date_filter in date_filters:
+            if not isinstance(parameters['date'].get(date_filter), bool):
+                raise ConfigError(f"Date filter '{date_filter}' must be a boolean in config file {config_yaml_path}")
+
+        # Validate positions and locations as lists of strings
+        if not all(isinstance(pos, str) for pos in parameters['positions']):
+            raise ConfigError(f"'positions' must be a list of strings in config file {config_yaml_path}")
+        if not all(isinstance(loc, str) for loc in parameters['locations']):
+            raise ConfigError(f"'locations' must be a list of strings in config file {config_yaml_path}")
+
+        # Validate distance
+        approved_distances = {0, 5, 10, 25, 50, 100}
+        if parameters['distance'] not in approved_distances:
+            raise ConfigError(f"Invalid distance value in config file {config_yaml_path}. Must be one of: {approved_distances}")
+
+        # Ensure blacklists are lists
+        for blacklist in ['companyBlacklist', 'titleBlacklist']:
+            if not isinstance(parameters.get(blacklist), list):
+                raise ConfigError(f"'{blacklist}' must be a list in config file {config_yaml_path}")
+            if parameters[blacklist] is None:
+                parameters[blacklist] = []
+
+        return parameters
+
+    @staticmethod
+    def validate_secrets(secrets_yaml_path: Path) -> str:
+        secrets = ConfigValidator.validate_yaml_file(secrets_yaml_path)
+        mandatory_secrets = ['llm_api_key']
+
+        for secret in mandatory_secrets:
+            if secret not in secrets:
+                raise ConfigError(f"Missing secret '{secret}' in file {secrets_yaml_path}")
+
+        if not secrets['llm_api_key']:
+            raise ConfigError(f"llm_api_key cannot be empty in secrets file {secrets_yaml_path}.")
+        return secrets['llm_api_key']
+
+class FileManager:
+    @staticmethod
+    def validate_data_folder(app_data_folder: Path) -> tuple:
+        if not app_data_folder.exists() or not app_data_folder.is_dir():
+            raise FileNotFoundError(f"Data folder not found: {app_data_folder}")
+
+        required_files = ['secrets.yaml', 'config.yaml', 'plain_text_resume.yaml']
+        missing_files = [file for file in required_files if not (app_data_folder / file).exists()]
+        
+        if missing_files:
+            raise FileNotFoundError(f"Missing files in the data folder: {', '.join(missing_files)}")
+
+        output_folder = app_data_folder / 'output'
+        output_folder.mkdir(exist_ok=True)
+        return (app_data_folder / 'secrets.yaml', app_data_folder / 'config.yaml', app_data_folder / 'plain_text_resume.yaml', output_folder)
+
+    @staticmethod
+    def file_paths_to_dict(resume_file: Path | None, plain_text_resume_file: Path) -> dict:
+        if not plain_text_resume_file.exists():
+            raise FileNotFoundError(f"Plain text resume file not found: {plain_text_resume_file}")
+
+        result = {'plainTextResume': plain_text_resume_file}
+
+        if resume_file:
+            if not resume_file.exists():
+                raise FileNotFoundError(f"Resume file not found: {resume_file}")
+            result['resume'] = resume_file
+
+        return result
+
+def init_browser() -> webdriver.Chrome:
+    try:
+        options = chrome_browser_options()
+        service = ChromeService(ChromeDriverManager().install())
+        return webdriver.Chrome(service=service, options=options)
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize browser: {str(e)}")
+
+def create_and_run_bot(parameters, llm_api_key):
+    try:
+        style_manager = StyleManager()
+        resume_generator = ResumeGenerator()
+        with open(parameters['uploads']['plainTextResume'], "r", encoding='utf-8') as file:
+            plain_text_resume = file.read()
+        resume_object = Resume(plain_text_resume)
+        resume_generator_manager = FacadeManager(llm_api_key, style_manager, resume_generator, resume_object, Path("data_folder/output"))
+        
+        # Run the resume generator manager's functions
+        resume_generator_manager.choose_style()
+        
+        job_application_profile_object = JobApplicationProfile(plain_text_resume)
+        
+        browser = init_browser()
+        login_component = AIHawkAuthenticator(browser)
+        apply_component = AIHawkJobManager(browser)
+        gpt_answerer_component = GPTAnswerer(parameters, llm_api_key)
+        bot = AIHawkBotFacade(login_component, apply_component)
+        bot.set_job_application_profile_and_resume(job_application_profile_object, resume_object)
+        bot.set_gpt_answerer_and_resume_generator(gpt_answerer_component, resume_generator_manager)
+        bot.set_parameters(parameters)
+        bot.start_login()
+        if (parameters['collectMode'] == True):
+            print('Collecting')
+            bot.start_collect_data()
+        else:
+            print('Applying')
+            bot.start_apply()
+    except WebDriverException as e:
+        logger.error(f"WebDriver error occurred: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Error running the bot: {str(e)}")
+
+
+@click.command()
+@click.option('--resume', type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path), help="Path to the resume PDF file")
+@click.option('--collect', is_flag=True, help="Only collects data job information into data.json file")
+def main(collect: False, resume: Path = None):
+    try:
+        data_folder = Path("data_folder")
+        secrets_file, config_file, plain_text_resume_file, output_folder = FileManager.validate_data_folder(data_folder)
+        
+        parameters = ConfigValidator.validate_config(config_file)
+        llm_api_key = ConfigValidator.validate_secrets(secrets_file)
+        
+        parameters['uploads'] = FileManager.file_paths_to_dict(resume, plain_text_resume_file)
+        parameters['outputFileDirectory'] = output_folder
+        parameters['collectMode'] = collect
+        
+        create_and_run_bot(parameters, llm_api_key)
+    except ConfigError as ce:
+        logger.error(f"Configuration error: {str(ce)}")
+        logger.error(f"Refer to the configuration guide for troubleshooting: https://github.com/feder-cr/Auto_Jobs_Applier_AIHawk?tab=readme-ov-file#configuration {str(ce)}")
+
+    except FileNotFoundError as fnf:
+        logger.error(f"File not found: {str(fnf)}")
+        logger.error("Ensure all required files are present in the data folder.")
+    except RuntimeError as re:
+        logger.error(f"Runtime error: {str(re)}")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    main()
+
+
+#project_dump.py
+
+#!/usr/bin/env python3
+import os
+import argparse
+from pathlib import Path
+from typing import Optional
+
+import pathspec
+
+
+def load_ignore_spec(root: Path, ignore_filename: str) -> Optional[pathspec.PathSpec]:
+    """
+    Load a .gitignore-style file from `root/ignore_filename` and
+    return a PathSpec that can test paths against it.
+    """
+    ignore_path = root / ignore_filename
+    if not ignore_path.is_file():
+        return None
+
+    lines = ignore_path.read_text(encoding="utf-8").splitlines()
+    spec = pathspec.GitIgnoreSpec.from_lines(lines)
+    return spec
+
+
+def is_ignored(path: Path, root: Path, spec: Optional[pathspec.PathSpec]) -> bool:
+    """Return True if `path` should be ignored according to `spec`."""
+    if spec is None:
+        return False
+
+    rel = path.relative_to(root).as_posix()
+    return spec.match_file(rel)
+
+
+def is_text_file(path: Path, blocksize: int = 1024) -> bool:
+    """
+    Heuristic check: consider a file 'text' if the first block has no NUL bytes.
+    This helps avoid dumping binaries into the LLM context.
+    """
+    try:
+        with path.open("rb") as f:
+            chunk = f.read(blocksize)
+        if b"\0" in chunk:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def is_dockerfile(path: Path) -> bool:
+    """
+    True if this is a Dockerfile.
+    """
+    return path.name == "Dockerfile"
+
+
+def is_docker_compose_file(path: Path) -> bool:
+    """
+    True if this looks like a docker-compose file.
+    Common names: docker-compose.yml / docker-compose.yaml
+    """
+    name = path.name.lower()
+    return name in {"docker-compose.yml", "docker-compose.yaml"}
+
+
+def should_include_file(path: Path) -> bool:
+    """
+    Only include:
+      - .py files
+      - Dockerfile
+      - docker-compose.yml / docker-compose.yaml
+      - .toml files
+    """
+    if is_dockerfile(path):
+        return True
+    if is_docker_compose_file(path):
+        return True
+    if path.suffix == ".py":
+        return True
+    if path.suffix == ".toml":
+        return True
+    return False
+
+
+def dump_project(root_dir: Path, output_file: Path, ignore_filename: str) -> None:
+    root_dir = root_dir.resolve()
+    output_file = output_file.resolve()
+
+    spec = load_ignore_spec(root_dir, ignore_filename)
+
+    with output_file.open("w", encoding="utf-8") as out_f:
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            dirpath = Path(dirpath)
+
+            # Filter out ignored directories so os.walk doesn't descend into them
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if not is_ignored(dirpath / d, root_dir, spec)
+            ]
+
+            for filename in filenames:
+                file_path = dirpath / filename
+
+                # Don't include the output file itself
+                if file_path == output_file:
+                    continue
+
+                # Skip ignored files
+                if is_ignored(file_path, root_dir, spec):
+                    continue
+
+                # Only include selected file types
+                if not should_include_file(file_path):
+                    continue
+
+                # Optionally skip binary-ish files even if they match extension
+                if not is_text_file(file_path):
+                    continue
+
+                rel_path = file_path.relative_to(root_dir).as_posix()
+
+                # Heading with NO space: "#path/to/file.py"
+                out_f.write(f"#{rel_path}\n\n")
+
+                try:
+                    with file_path.open(
+                        "r", encoding="utf-8", errors="replace"
+                    ) as in_f:
+                        for line in in_f:
+                            out_f.write(line)
+                except Exception as e:
+                    out_f.write(f"# [Error reading file {rel_path}: {e}]\n")
+
+                out_f.write("\n\n")  # blank line between files
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Dump selected project files into a single text file, "
+            "respecting a .gitignore-style ignore file."
+        )
+    )
+    parser.add_argument(
+        "root",
+        nargs="?",
+        default=".",
+        help="Root folder to walk (default: current directory).",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="project_dump.txt",
+        help="Output text file path (default: project_dump.txt).",
+    )
+    parser.add_argument(
+        "-i",
+        "--ignore-file",
+        default=".gitignore",
+        help="Ignore file name (default: .gitignore).",
+    )
+
+    args = parser.parse_args()
+
+    root_dir = Path(args.root)
+    output_file = Path(args.output)
+    dump_project(root_dir, output_file, args.ignore_file)
+
+
+if __name__ == "__main__":
+    main()
+
+
+#src/aihawk_authenticator.py
+
+import random
+import time
+
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, NoAlertPresentException, TimeoutException, UnexpectedAlertPresentException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+from loguru import logger
+
+
+class AIHawkAuthenticator:
+
+    def __init__(self, driver=None):
+        self.driver = driver
+        logger.debug(f"AIHawkAuthenticator initialized with driver: {driver}")
+
+    def start(self):
+        logger.info("Starting Chrome browser to log in to AIHawk.")
+        if self.is_logged_in():
+            logger.info("User is already logged in. Skipping login process.")
+            return
+        else:
+            logger.info("User is not logged in. Proceeding with login.")
+            self.handle_login()
+
+    def handle_login(self):
+        logger.info("Navigating to the AIHawk login page...")
+        self.driver.get("https://www.linkedin.com/login")
+        if 'feed' in self.driver.current_url:
+            logger.debug("User is already logged in.")
+            return
+        try:
+            self.enter_credentials()
+        except NoSuchElementException as e:
+            logger.error(f"Could not log in to AIHawk. Element not found: {e}")
+        self.handle_security_check()
+
+
+    def enter_credentials(self):
+        try:
+            logger.debug("Enter credentials...")
+            
+            check_interval = 4  # Interval to log the current URL
+            elapsed_time = 0
+
+            while True:
+                # Log current URL every 4 seconds and remind the user to log in
+                current_url = self.driver.current_url
+                logger.info(f"Please login on {current_url}")
+
+                # Check if the user is already on the feed page
+                if 'feed' in current_url:
+                    logger.debug("Login successful, redirected to feed page.")
+                    break
+                else:
+                    # Optionally wait for the password field (or any other element you expect on the login page)
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.ID, "password"))
+                    )
+                    logger.debug("Password field detected, waiting for login completion.")
+
+                time.sleep(check_interval)
+                elapsed_time += check_interval
+
+        except TimeoutException:
+            logger.error("Login form not found. Aborting login.")
+
+
+    def handle_security_check(self):
+        try:
+            logger.debug("Handling security check...")
+            WebDriverWait(self.driver, 10).until(
+                EC.url_contains('https://www.linkedin.com/checkpoint/challengesV2/')
+            )
+            logger.warning("Security checkpoint detected. Please complete the challenge.")
+            WebDriverWait(self.driver, 300).until(
+                EC.url_contains('https://www.linkedin.com/feed/')
+            )
+            logger.info("Security check completed")
+        except TimeoutException:
+            logger.error("Security check not completed. Please try again later.")
+
+    def is_logged_in(self):
+        try:
+            self.driver.get('https://www.linkedin.com/feed')
+            logger.debug("Checking if user is logged in...")
+            WebDriverWait(self.driver, 3).until(
+                EC.presence_of_element_located((By.CLASS_NAME, 'share-box-feed-entry__trigger'))
+            )
+
+            # Check for the presence of the "Start a post" button
+            buttons = self.driver.find_elements(By.CLASS_NAME, 'share-box-feed-entry__trigger')
+            logger.debug(f"Found {len(buttons)} 'Start a post' buttons")
+
+            for i, button in enumerate(buttons):
+                logger.debug(f"Button {i + 1} text: {button.text.strip()}")
+
+            if any(button.text.strip().lower() == 'start a post' for button in buttons):
+                logger.info("Found 'Start a post' button indicating user is logged in.")
+                return True
+
+            profile_img_elements = self.driver.find_elements(By.XPATH, "//img[contains(@alt, 'Photo of')]")
+            if profile_img_elements:
+                logger.info("Profile image found. Assuming user is logged in.")
+                return True
+
+            logger.info("Did not find 'Start a post' button or profile image. User might not be logged in.")
+            return False
+
+        except TimeoutException:
+            logger.error("Page elements took too long to load or were not found.")
+            return False
+
+#src/aihawk_bot_facade.py
+
+from loguru import logger
+
+
+class AIHawkBotState:
+    def __init__(self):
+        logger.debug("Initializing AIHawkBotState")
+        self.reset()
+
+    def reset(self):
+        logger.debug("Resetting AIHawkBotState")
+        self.credentials_set = False
+        self.api_key_set = False
+        self.job_application_profile_set = False
+        self.gpt_answerer_set = False
+        self.parameters_set = False
+        self.logged_in = False
+
+    def validate_state(self, required_keys):
+        logger.debug(f"Validating AIHawkBotState with required keys: {required_keys}")
+        for key in required_keys:
+            if not getattr(self, key):
+                logger.error(f"State validation failed: {key} is not set")
+                raise ValueError(f"{key.replace('_', ' ').capitalize()} must be set before proceeding.")
+        logger.debug("State validation passed")
+
+
+class AIHawkBotFacade:
+    def __init__(self, login_component, apply_component):
+        logger.debug("Initializing AIHawkBotFacade")
+        self.login_component = login_component
+        self.apply_component = apply_component
+        self.state = AIHawkBotState()
+        self.job_application_profile = None
+        self.resume = None
+        self.email = None
+        self.password = None
+        self.parameters = None
+
+    def set_job_application_profile_and_resume(self, job_application_profile, resume):
+        logger.debug("Setting job application profile and resume")
+        self._validate_non_empty(job_application_profile, "Job application profile")
+        self._validate_non_empty(resume, "Resume")
+        self.job_application_profile = job_application_profile
+        self.resume = resume
+        self.state.job_application_profile_set = True
+        logger.debug("Job application profile and resume set successfully")
+
+
+    def set_gpt_answerer_and_resume_generator(self, gpt_answerer_component, resume_generator_manager):
+        logger.debug("Setting GPT answerer and resume generator")
+        self._ensure_job_profile_and_resume_set()
+        gpt_answerer_component.set_job_application_profile(self.job_application_profile)
+        gpt_answerer_component.set_resume(self.resume)
+        self.apply_component.set_gpt_answerer(gpt_answerer_component)
+        self.apply_component.set_resume_generator_manager(resume_generator_manager)
+        self.state.gpt_answerer_set = True
+        logger.debug("GPT answerer and resume generator set successfully")
+
+    def set_parameters(self, parameters):
+        logger.debug("Setting parameters")
+        self._validate_non_empty(parameters, "Parameters")
+        self.parameters = parameters
+        self.apply_component.set_parameters(parameters)
+        self.state.credentials_set = True
+        self.state.parameters_set = True
+        logger.debug("Parameters set successfully")
+
+    def start_login(self):
+        logger.debug("Starting login process")
+        self.state.validate_state(['credentials_set'])
+        self.login_component.start()
+        self.state.logged_in = True
+        logger.debug("Login process completed successfully")
+
+    def start_apply(self):
+        logger.debug("Starting apply process")
+        self.state.validate_state(['logged_in', 'job_application_profile_set', 'gpt_answerer_set', 'parameters_set'])
+        self.apply_component.start_applying()
+        logger.debug("Apply process started successfully")
+        
+    def start_collect_data(self):
+        logger.debug("Starting collecting data process")
+        self.state.validate_state(['logged_in', 'job_application_profile_set', 'gpt_answerer_set', 'parameters_set'])
+        self.apply_component.start_collecting_data()
+        logger.debug("Collecting data process started successfully")
+
+    def _validate_non_empty(self, value, name):
+        logger.debug(f"Validating that {name} is not empty")
+        if not value:
+            logger.error(f"Validation failed: {name} is empty")
+            raise ValueError(f"{name} cannot be empty.")
+        logger.debug(f"Validation passed for {name}")
+
+    def _ensure_job_profile_and_resume_set(self):
+        logger.debug("Ensuring job profile and resume are set")
+        if not self.state.job_application_profile_set:
+            logger.error("Job application profile and resume are not set")
+            raise ValueError("Job application profile and resume must be set before proceeding.")
+        logger.debug("Job profile and resume are set")
+
+
+#src/aihawk_easy_applier.py
+
+import base64
+import json
+import os
+import random
+import re
+import time
+import traceback
+from typing import List, Optional, Any, Tuple
+
+from httpx import HTTPStatusError
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from selenium.webdriver import ActionChains
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import Select, WebDriverWait
+
+import src.utils as utils
+from loguru import logger
+
+
+class AIHawkEasyApplier:
+    def __init__(self, driver: Any, resume_dir: Optional[str], set_old_answers: List[Tuple[str, str, str]],
+                 gpt_answerer: Any, resume_generator_manager):
+        logger.debug("Initializing AIHawkEasyApplier")
+        if resume_dir is None or not os.path.exists(resume_dir):
+            resume_dir = None
+        self.driver = driver
+        self.resume_path = resume_dir
+        self.set_old_answers = set_old_answers
+        self.gpt_answerer = gpt_answerer
+        self.resume_generator_manager = resume_generator_manager
+        self.all_data = self._load_questions_from_json()
+
+        logger.debug("AIHawkEasyApplier initialized successfully")
+
+    def _load_questions_from_json(self) -> List[dict]:
+        output_file = 'answers.json'
+        logger.debug(f"Loading questions from JSON file: {output_file}")
+        try:
+            with open(output_file, 'r') as f:
+                try:
+                    data = json.load(f)
+                    if not isinstance(data, list):
+                        raise ValueError("JSON file format is incorrect. Expected a list of questions.")
+                except json.JSONDecodeError:
+                    logger.error("JSON decoding failed")
+                    data = []
+            logger.debug("Questions loaded successfully from JSON")
+            return data
+        except FileNotFoundError:
+            logger.warning("JSON file not found, returning empty list")
+            return []
+        except Exception:
+            tb_str = traceback.format_exc()
+            logger.error(f"Error loading questions data from JSON file: {tb_str}")
+            raise Exception(f"Error loading questions data from JSON file: \nTraceback:\n{tb_str}")
+
+    def check_for_premium_redirect(self, job: Any, max_attempts=3):
+
+        current_url = self.driver.current_url
+        attempts = 0
+
+        while "linkedin.com/premium" in current_url and attempts < max_attempts:
+            logger.warning("Redirected to AIHawk Premium page. Attempting to return to job page.")
+            attempts += 1
+
+            self.driver.get(job.link)
+            time.sleep(2)
+            current_url = self.driver.current_url
+
+        if "linkedin.com/premium" in current_url:
+            logger.error(f"Failed to return to job page after {max_attempts} attempts. Cannot apply for the job.")
+            raise Exception(
+                f"Redirected to AIHawk Premium page and failed to return after {max_attempts} attempts. Job application aborted.")
+            
+    def apply_to_job(self, job: Any) -> None:
+        """
+        Starts the process of applying to a job.
+        :param job: A job object with the job details.
+        :return: None
+        """
+        logger.debug(f"Applying to job: {job}")
+        try:
+            self.job_apply(job)
+            logger.info(f"Successfully applied to job: {job.title}")
+        except Exception as e:
+            logger.error(f"Failed to apply to job: {job.title}, error: {str(e)}")
+            raise e
+
+    def job_apply(self, job: Any):
+        logger.debug(f"Starting job application for job: {job}")
+
+        try:
+            self.driver.get(job.link)
+            logger.debug(f"Navigated to job link: {job.link}")
+        except Exception as e:
+            logger.error(f"Failed to navigate to job link: {job.link}, error: {str(e)}")
+            raise
+
+        time.sleep(random.uniform(3, 5))
+        self.check_for_premium_redirect(job)
+
+        try:
+
+            self.driver.execute_script("document.activeElement.blur();")
+            logger.debug("Focus removed from the active element")
+
+            self.check_for_premium_redirect(job)
+
+            easy_apply_button = self._find_easy_apply_button(job)
+
+            self.check_for_premium_redirect(job)
+
+            logger.debug("Retrieving job description")
+            job_description = self._get_job_description()
+            job.set_job_description(job_description)
+            logger.debug(f"Job description set: {job_description[:100]}")
+
+            logger.debug("Retrieving recruiter link")
+            recruiter_link = self._get_job_recruiter()
+            job.set_recruiter_link(recruiter_link)
+            logger.debug(f"Recruiter link set: {recruiter_link}")
+
+            logger.debug("Attempting to click 'Easy Apply' button")
+            actions = ActionChains(self.driver)
+            actions.move_to_element(easy_apply_button).click().perform()
+            logger.debug("'Easy Apply' button clicked successfully")
+
+            logger.debug("Passing job information to GPT Answerer")
+            self.gpt_answerer.set_job(job)
+
+            logger.debug("Filling out application form")
+            self._fill_application_form(job)
+            logger.debug(f"Job application process completed successfully for job: {job}")
+
+        except Exception as e:
+
+            tb_str = traceback.format_exc()
+            logger.error(f"Failed to apply to job: {job}, error: {tb_str}")
+
+            logger.debug("Discarding application due to failure")
+            self._discard_application()
+
+            raise Exception(f"Failed to apply to job! Original exception:\nTraceback:\n{tb_str}")
+
+    def _find_easy_apply_button(self, job: Any) -> WebElement:
+        logger.debug("Searching for 'Easy Apply' button")
+        attempt = 0
+
+        search_methods = [
+            {
+                'description': "find all 'Easy Apply' buttons using find_elements",
+                'find_elements': True,
+                'xpath': '//button[contains(@class, "jobs-apply-button") and contains(., "Easy Apply")]'
+            },
+            {
+                'description': "'aria-label' containing 'Easy Apply to'",
+                'xpath': '//button[contains(@aria-label, "Easy Apply to")]'
+            },
+            {
+                'description': "button text search",
+                'xpath': '//button[contains(text(), "Easy Apply") or contains(text(), "Apply now")]'
+            }
+        ]
+
+        while attempt < 2:
+
+            self.check_for_premium_redirect(job)
+            self._scroll_page()
+
+            for method in search_methods:
+                try:
+                    logger.debug(f"Attempting search using {method['description']}")
+
+                    if method.get('find_elements'):
+
+                        buttons = self.driver.find_elements(By.XPATH, method['xpath'])
+                        if buttons:
+                            for index, button in enumerate(buttons):
+                                try:
+
+                                    WebDriverWait(self.driver, 10).until(EC.visibility_of(button))
+                                    WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable(button))
+                                    logger.debug(f"Found 'Easy Apply' button {index + 1}, attempting to click")
+                                    return button
+                                except Exception as e:
+                                    logger.warning(f"Button {index + 1} found but not clickable: {e}")
+                        else:
+                            raise TimeoutException("No 'Easy Apply' buttons found")
+                    else:
+
+                        button = WebDriverWait(self.driver, 10).until(
+                            EC.presence_of_element_located((By.XPATH, method['xpath']))
+                        )
+                        WebDriverWait(self.driver, 10).until(EC.visibility_of(button))
+                        WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable(button))
+                        logger.debug("Found 'Easy Apply' button, attempting to click")
+                        return button
+
+                except TimeoutException:
+                    logger.warning(f"Timeout during search using {method['description']}")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to click 'Easy Apply' button using {method['description']} on attempt {attempt + 1}: {e}")
+
+            self.check_for_premium_redirect(job)
+
+            if attempt == 0:
+                logger.debug("Refreshing page to retry finding 'Easy Apply' button")
+                self.driver.refresh()
+                time.sleep(random.randint(3, 5))
+            attempt += 1
+
+        page_source = self.driver.page_source
+        logger.error(f"No clickable 'Easy Apply' button found after 2 attempts. Page source:\n{page_source}")
+        raise Exception("No clickable 'Easy Apply' button found")
+
+    def _get_job_description(self) -> str:
+        logger.debug("Getting job description")
+        try:
+            try:
+                see_more_button = self.driver.find_element(By.XPATH,
+                                                           '//button[@aria-label="Click to see more description"]')
+                actions = ActionChains(self.driver)
+                actions.move_to_element(see_more_button).click().perform()
+                time.sleep(2)
+            except NoSuchElementException:
+                logger.debug("See more button not found, skipping")
+
+            description = self.driver.find_element(By.CLASS_NAME, 'jobs-description-content__text').text
+            logger.debug("Job description retrieved successfully")
+            return description
+        except NoSuchElementException:
+            tb_str = traceback.format_exc()
+            logger.error(f"Job description not found: {tb_str}")
+            raise Exception(f"Job description not found: \nTraceback:\n{tb_str}")
+        except Exception:
+            tb_str = traceback.format_exc()
+            logger.error(f"Error getting Job description: {tb_str}")
+            raise Exception(f"Error getting Job description: \nTraceback:\n{tb_str}")
+
+    def _get_job_recruiter(self):
+        logger.debug("Getting job recruiter information")
+        try:
+            hiring_team_section = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, '//h2[text()="Meet the hiring team"]'))
+            )
+            logger.debug("Hiring team section found")
+
+            recruiter_elements = hiring_team_section.find_elements(By.XPATH,
+                                                                   './/following::a[contains(@href, "linkedin.com/in/")]')
+
+            if recruiter_elements:
+                recruiter_element = recruiter_elements[0]
+                recruiter_link = recruiter_element.get_attribute('href')
+                logger.debug(f"Job recruiter link retrieved successfully: {recruiter_link}")
+                return recruiter_link
+            else:
+                logger.debug("No recruiter link found in the hiring team section")
+                return ""
+        except Exception as e:
+            logger.warning(f"Failed to retrieve recruiter information: {e}")
+            return ""
+
+    def _scroll_page(self) -> None:
+        logger.debug("Scrolling the page")
+        scrollable_element = self.driver.find_element(By.TAG_NAME, 'html')
+        utils.scroll_slow(self.driver, scrollable_element, step=300, reverse=False)
+        utils.scroll_slow(self.driver, scrollable_element, step=300, reverse=True)
+
+    def _fill_application_form(self, job):
+        logger.debug(f"Filling out application form for job: {job}")
+        while True:
+            self.fill_up(job)
+            if self._next_or_submit():
+                logger.debug("Application form submitted")
+                break
+
+    def _next_or_submit(self):
+        logger.debug("Clicking 'Next' or 'Submit' button")
+        next_button = self.driver.find_element(By.CLASS_NAME, "artdeco-button--primary")
+        button_text = next_button.text.lower()
+        if 'submit application' in button_text:
+            logger.debug("Submit button found, submitting application")
+            self._unfollow_company()
+            time.sleep(random.uniform(1.5, 2.5))
+            next_button.click()
+            time.sleep(random.uniform(1.5, 2.5))
+            return True
+        time.sleep(random.uniform(1.5, 2.5))
+        next_button.click()
+        time.sleep(random.uniform(3.0, 5.0))
+        self._check_for_errors()
+
+    def _unfollow_company(self) -> None:
+        try:
+            logger.debug("Unfollowing company")
+            follow_checkbox = self.driver.find_element(
+                By.XPATH, "//label[contains(.,'to stay up to date with their page.')]")
+            follow_checkbox.click()
+        except Exception as e:
+            logger.debug(f"Failed to unfollow company: {e}")
+
+    def _check_for_errors(self) -> None:
+        logger.debug("Checking for form errors")
+        error_elements = self.driver.find_elements(By.CLASS_NAME, 'artdeco-inline-feedback--error')
+        if error_elements:
+            logger.error(f"Form submission failed with errors: {error_elements}")
+            raise Exception(f"Failed answering or file upload. {str([e.text for e in error_elements])}")
+
+    def _discard_application(self) -> None:
+        logger.debug("Discarding application")
+        try:
+            self.driver.find_element(By.CLASS_NAME, 'artdeco-modal__dismiss').click()
+            time.sleep(random.uniform(3, 5))
+            self.driver.find_elements(By.CLASS_NAME, 'artdeco-modal__confirm-dialog-btn')[0].click()
+            time.sleep(random.uniform(3, 5))
+        except Exception as e:
+            logger.warning(f"Failed to discard application: {e}")
+
+    def fill_up(self, job) -> None:
+        logger.debug(f"Filling up form sections for job: {job}")
+
+        try:
+            easy_apply_content = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CLASS_NAME, 'jobs-easy-apply-content'))
+            )
+
+            pb4_elements = easy_apply_content.find_elements(By.CLASS_NAME, 'pb4')
+            for element in pb4_elements:
+                self._process_form_element(element, job)
+        except Exception as e:
+            logger.error(f"Failed to find form elements: {e}")
+
+    def _process_form_element(self, element: WebElement, job) -> None:
+        logger.debug("Processing form element")
+        if self._is_upload_field(element):
+            self._handle_upload_fields(element, job)
+        else:
+            self._fill_additional_questions()
+
+    def _handle_dropdown_fields(self, element: WebElement) -> None:
+        logger.debug("Handling dropdown fields")
+
+        dropdown = element.find_element(By.TAG_NAME, 'select')
+        select = Select(dropdown)
+        dropdown_id = dropdown.get_attribute('id')
+        if 'phoneNumber-Country' in dropdown_id:
+            country = self.resume_generator_manager.get_resume_country()
+            if country:
+                try:
+                    select.select_by_value(country)
+                    logger.debug(f"Selected phone country: {country}")
+                    return True
+                except NoSuchElementException:
+                    logger.warning(f"Country {country} not found in dropdown options")
+
+        options = [option.text for option in select.options]
+        logger.debug(f"Dropdown options found: {options}")
+
+        parent_element = dropdown.find_element(By.XPATH, '../..')
+
+        label_elements = parent_element.find_elements(By.TAG_NAME, 'label')
+        if label_elements:
+            question_text = label_elements[0].text.lower()
+        else:
+            question_text = "unknown"
+
+        logger.debug(f"Detected question text: {question_text}")
+
+        existing_answer = None
+        for item in self.all_data:
+            if self._sanitize_text(question_text) in item['question'] and item['type'] == 'dropdown':
+                existing_answer = item['answer']
+                break
+
+        if existing_answer:
+            logger.debug(f"Found existing answer for question '{question_text}': {existing_answer}")
+        else:
+            logger.debug(f"No existing answer found, querying model for: {question_text}")
+            existing_answer = self.gpt_answerer.answer_question_from_options(question_text, options)
+            logger.debug(f"Model provided answer: {existing_answer}")
+            self._save_questions_to_json({'type': 'dropdown', 'question': question_text, 'answer': existing_answer})
+
+        if existing_answer in options:
+            select.select_by_visible_text(existing_answer)
+            logger.debug(f"Selected option: {existing_answer}")
+        else:
+            logger.error(f"Answer '{existing_answer}' is not a valid option in the dropdown")
+            raise Exception(f"Invalid option selected: {existing_answer}")
+
+    def _is_upload_field(self, element: WebElement) -> bool:
+        is_upload = bool(element.find_elements(By.XPATH, ".//input[@type='file']"))
+        logger.debug(f"Element is upload field: {is_upload}")
+        return is_upload
+
+    def _handle_upload_fields(self, element: WebElement, job) -> None:
+        logger.debug("Handling upload fields")
+
+        try:
+            show_more_button = self.driver.find_element(By.XPATH,
+                                                        "//button[contains(@aria-label, 'Show more resumes')]")
+            show_more_button.click()
+            logger.debug("Clicked 'Show more resumes' button")
+        except NoSuchElementException:
+            logger.debug("'Show more resumes' button not found, continuing...")
+
+        file_upload_elements = self.driver.find_elements(By.XPATH, "//input[@type='file']")
+        for element in file_upload_elements:
+            parent = element.find_element(By.XPATH, "..")
+            self.driver.execute_script("arguments[0].classList.remove('hidden')", element)
+
+            output = self.gpt_answerer.resume_or_cover(parent.text.lower())
+            if 'resume' in output:
+                logger.debug("Uploading resume")
+                if self.resume_path is not None and self.resume_path.resolve().is_file():
+                    element.send_keys(str(self.resume_path.resolve()))
+                    logger.debug(f"Resume uploaded from path: {self.resume_path.resolve()}")
+                else:
+                    logger.debug("Resume path not found or invalid, generating new resume")
+                    self._create_and_upload_resume(element, job)
+            elif 'cover' in output:
+                logger.debug("Uploading cover letter")
+                self._create_and_upload_cover_letter(element, job)
+
+        logger.debug("Finished handling upload fields")
+
+    def _create_and_upload_resume(self, element, job):
+        logger.debug("Starting the process of creating and uploading resume.")
+        folder_path = 'generated_cv'
+
+        try:
+            if not os.path.exists(folder_path):
+                logger.debug(f"Creating directory at path: {folder_path}")
+            os.makedirs(folder_path, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create directory: {folder_path}. Error: {e}")
+            raise
+
+        while True:
+            try:
+                timestamp = int(time.time())
+                file_path_pdf = os.path.join(folder_path, f"CV_{timestamp}.pdf")
+                logger.debug(f"Generated file path for resume: {file_path_pdf}")
+
+                logger.debug(f"Generating resume for job: {job.title} at {job.company}")
+                resume_pdf_base64 = self.resume_generator_manager.pdf_base64(job_description_text=job.description)
+                with open(file_path_pdf, "xb") as f:
+                    f.write(base64.b64decode(resume_pdf_base64))
+                logger.debug(f"Resume successfully generated and saved to: {file_path_pdf}")
+
+                break
+            except HTTPStatusError as e:
+                if e.response.status_code == 429:
+
+                    retry_after = e.response.headers.get('retry-after')
+                    retry_after_ms = e.response.headers.get('retry-after-ms')
+
+                    if retry_after:
+                        wait_time = int(retry_after)
+                        logger.warning(f"Rate limit exceeded, waiting {wait_time} seconds before retrying...")
+                    elif retry_after_ms:
+                        wait_time = int(retry_after_ms) / 1000.0
+                        logger.warning(f"Rate limit exceeded, waiting {wait_time} milliseconds before retrying...")
+                    else:
+                        wait_time = 20
+                        logger.warning(f"Rate limit exceeded, waiting {wait_time} seconds before retrying...")
+
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"HTTP error: {e}")
+                    raise
+
+            except Exception as e:
+                logger.error(f"Failed to generate resume: {e}")
+                tb_str = traceback.format_exc()
+                logger.error(f"Traceback: {tb_str}")
+                if "RateLimitError" in str(e):
+                    logger.warning("Rate limit error encountered, retrying...")
+                    time.sleep(20)
+                else:
+                    raise
+
+        file_size = os.path.getsize(file_path_pdf)
+        max_file_size = 2 * 1024 * 1024  # 2 MB
+        logger.debug(f"Resume file size: {file_size} bytes")
+        if file_size > max_file_size:
+            logger.error(f"Resume file size exceeds 2 MB: {file_size} bytes")
+            raise ValueError("Resume file size exceeds the maximum limit of 2 MB.")
+
+        allowed_extensions = {'.pdf', '.doc', '.docx'}
+        file_extension = os.path.splitext(file_path_pdf)[1].lower()
+        logger.debug(f"Resume file extension: {file_extension}")
+        if file_extension not in allowed_extensions:
+            logger.error(f"Invalid resume file format: {file_extension}")
+            raise ValueError("Resume file format is not allowed. Only PDF, DOC, and DOCX formats are supported.")
+
+        try:
+            logger.debug(f"Uploading resume from path: {file_path_pdf}")
+            element.send_keys(os.path.abspath(file_path_pdf))
+            job.pdf_path = os.path.abspath(file_path_pdf)
+            time.sleep(2)
+            logger.debug(f"Resume created and uploaded successfully: {file_path_pdf}")
+        except Exception as e:
+            tb_str = traceback.format_exc()
+            logger.error(f"Resume upload failed: {tb_str}")
+            raise Exception(f"Upload failed: \nTraceback:\n{tb_str}")
+
+    def _create_and_upload_cover_letter(self, element: WebElement, job) -> None:
+        logger.debug("Starting the process of creating and uploading cover letter.")
+
+        cover_letter_text = self.gpt_answerer.answer_question_textual_wide_range("Write a cover letter")
+
+        folder_path = 'generated_cv'
+
+        try:
+
+            if not os.path.exists(folder_path):
+                logger.debug(f"Creating directory at path: {folder_path}")
+            os.makedirs(folder_path, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create directory: {folder_path}. Error: {e}")
+            raise
+
+        while True:
+            try:
+                timestamp = int(time.time())
+                file_path_pdf = os.path.join(folder_path, f"Cover_Letter_{timestamp}.pdf")
+                logger.debug(f"Generated file path for cover letter: {file_path_pdf}")
+
+                c = canvas.Canvas(file_path_pdf, pagesize=A4)
+                page_width, page_height = A4
+                text_object = c.beginText(50, page_height - 50)
+                text_object.setFont("Helvetica", 12)
+
+                max_width = page_width - 100
+                bottom_margin = 50
+                available_height = page_height - bottom_margin - 50
+
+                def split_text_by_width(text, font, font_size, max_width):
+                    wrapped_lines = []
+                    for line in text.splitlines():
+
+                        if stringWidth(line, font, font_size) > max_width:
+                            words = line.split()
+                            new_line = ""
+                            for word in words:
+                                if stringWidth(new_line + word + " ", font, font_size) <= max_width:
+                                    new_line += word + " "
+                                else:
+                                    wrapped_lines.append(new_line.strip())
+                                    new_line = word + " "
+                            wrapped_lines.append(new_line.strip())
+                        else:
+                            wrapped_lines.append(line)
+                    return wrapped_lines
+
+                lines = split_text_by_width(cover_letter_text, "Helvetica", 12, max_width)
+
+                for line in lines:
+                    text_height = text_object.getY()
+                    if text_height > bottom_margin:
+                        text_object.textLine(line)
+                    else:
+
+                        c.drawText(text_object)
+                        c.showPage()
+                        text_object = c.beginText(50, page_height - 50)
+                        text_object.setFont("Helvetica", 12)
+                        text_object.textLine(line)
+
+                c.drawText(text_object)
+                c.save()
+                logger.debug(f"Cover letter successfully generated and saved to: {file_path_pdf}")
+
+                break
+            except Exception as e:
+                logger.error(f"Failed to generate cover letter: {e}")
+                tb_str = traceback.format_exc()
+                logger.error(f"Traceback: {tb_str}")
+                raise
+
+        file_size = os.path.getsize(file_path_pdf)
+        max_file_size = 2 * 1024 * 1024  # 2 MB
+        logger.debug(f"Cover letter file size: {file_size} bytes")
+        if file_size > max_file_size:
+            logger.error(f"Cover letter file size exceeds 2 MB: {file_size} bytes")
+            raise ValueError("Cover letter file size exceeds the maximum limit of 2 MB.")
+
+        allowed_extensions = {'.pdf', '.doc', '.docx'}
+        file_extension = os.path.splitext(file_path_pdf)[1].lower()
+        logger.debug(f"Cover letter file extension: {file_extension}")
+        if file_extension not in allowed_extensions:
+            logger.error(f"Invalid cover letter file format: {file_extension}")
+            raise ValueError("Cover letter file format is not allowed. Only PDF, DOC, and DOCX formats are supported.")
+
+        try:
+
+            logger.debug(f"Uploading cover letter from path: {file_path_pdf}")
+            element.send_keys(os.path.abspath(file_path_pdf))
+            job.cover_letter_path = os.path.abspath(file_path_pdf)
+            time.sleep(2)
+            logger.debug(f"Cover letter created and uploaded successfully: {file_path_pdf}")
+        except Exception as e:
+            tb_str = traceback.format_exc()
+            logger.error(f"Cover letter upload failed: {tb_str}")
+            raise Exception(f"Upload failed: \nTraceback:\n{tb_str}")
+
+    def _fill_additional_questions(self) -> None:
+        logger.debug("Filling additional questions")
+        form_sections = self.driver.find_elements(By.CLASS_NAME, 'jobs-easy-apply-form-section__grouping')
+        for section in form_sections:
+            self._process_form_section(section)
+
+    def _process_form_section(self, section: WebElement) -> None:
+        logger.debug("Processing form section")
+        if self._handle_terms_of_service(section):
+            logger.debug("Handled terms of service")
+            return
+        if self._find_and_handle_radio_question(section):
+            logger.debug("Handled radio question")
+            return
+        if self._find_and_handle_textbox_question(section):
+            logger.debug("Handled textbox question")
+            return
+        if self._find_and_handle_date_question(section):
+            logger.debug("Handled date question")
+            return
+
+        if self._find_and_handle_dropdown_question(section):
+            logger.debug("Handled dropdown question")
+            return
+
+    def _handle_terms_of_service(self, element: WebElement) -> bool:
+        checkbox = element.find_elements(By.TAG_NAME, 'label')
+        if checkbox and any(
+                term in checkbox[0].text.lower() for term in ['terms of service', 'privacy policy', 'terms of use']):
+            checkbox[0].click()
+            logger.debug("Clicked terms of service checkbox")
+            return True
+        return False
+
+    def _find_and_handle_radio_question(self, section: WebElement) -> bool:
+        question = section.find_element(By.CLASS_NAME, 'jobs-easy-apply-form-element')
+        radios = question.find_elements(By.CLASS_NAME, 'fb-text-selectable__option')
+        if radios:
+            question_text = section.text.lower()
+            options = [radio.text.lower() for radio in radios]
+
+            existing_answer = None
+            for item in self.all_data:
+                if self._sanitize_text(question_text) in item['question'] and item['type'] == 'radio':
+                    existing_answer = item
+
+                    break
+            if existing_answer:
+                self._select_radio(radios, existing_answer['answer'])
+                logger.debug("Selected existing radio answer")
+                return True
+
+            answer = self.gpt_answerer.answer_question_from_options(question_text, options)
+            self._save_questions_to_json({'type': 'radio', 'question': question_text, 'answer': answer})
+            self._select_radio(radios, answer)
+            logger.debug("Selected new radio answer")
+            return True
+        return False
+
+    def _find_and_handle_textbox_question(self, section: WebElement) -> bool:
+        logger.debug("Searching for text fields in the section.")
+        text_fields = section.find_elements(By.TAG_NAME, 'input') + section.find_elements(By.TAG_NAME, 'textarea')
+
+        if text_fields:
+            text_field = text_fields[0]
+            question_text = section.find_element(By.TAG_NAME, 'label').text.lower().strip()
+            logger.debug(f"Found text field with label: {question_text}")
+
+            is_numeric = self._is_numeric_field(text_field)
+            logger.debug(f"Is the field numeric? {'Yes' if is_numeric else 'No'}")
+
+            question_type = 'numeric' if is_numeric else 'textbox'
+
+            # Check if it's a cover letter field (case-insensitive)
+            is_cover_letter = 'cover letter' in question_text.lower()
+
+            # Look for existing answer if it's not a cover letter field
+            existing_answer = None
+            if not is_cover_letter:
+                for item in self.all_data:
+                    if self._sanitize_text(item['question']) == self._sanitize_text(question_text) and item.get('type') == question_type:
+                        existing_answer = item['answer']
+                        logger.debug(f"Found existing answer: {existing_answer}")
+                        break
+
+            if existing_answer and not is_cover_letter:
+                answer = existing_answer
+                logger.debug(f"Using existing answer: {answer}")
+            else:
+                if is_numeric:
+                    answer = self.gpt_answerer.answer_question_numeric(question_text)
+                    logger.debug(f"Generated numeric answer: {answer}")
+                else:
+                    answer = self.gpt_answerer.answer_question_textual_wide_range(question_text)
+                    logger.debug(f"Generated textual answer: {answer}")
+
+            self._enter_text(text_field, answer)
+            logger.debug("Entered answer into the textbox.")
+
+            # Save non-cover letter answers
+            if not is_cover_letter:
+                self._save_questions_to_json({'type': question_type, 'question': question_text, 'answer': answer})
+                logger.debug("Saved non-cover letter answer to JSON.")
+
+            time.sleep(1)
+            text_field.send_keys(Keys.ARROW_DOWN)
+            text_field.send_keys(Keys.ENTER)
+            logger.debug("Selected first option from the dropdown.")
+            return True
+
+        logger.debug("No text fields found in the section.")
+        return False
+
+    def _find_and_handle_date_question(self, section: WebElement) -> bool:
+        date_fields = section.find_elements(By.CLASS_NAME, 'artdeco-datepicker__input ')
+        if date_fields:
+            date_field = date_fields[0]
+            question_text = section.text.lower()
+            answer_date = self.gpt_answerer.answer_question_date()
+            answer_text = answer_date.strftime("%Y-%m-%d")
+
+            existing_answer = None
+            for item in self.all_data:
+                if self._sanitize_text(question_text) in item['question'] and item['type'] == 'date':
+                    existing_answer = item
+
+                    break
+            if existing_answer:
+                self._enter_text(date_field, existing_answer['answer'])
+                logger.debug("Entered existing date answer")
+                return True
+
+            self._save_questions_to_json({'type': 'date', 'question': question_text, 'answer': answer_text})
+            self._enter_text(date_field, answer_text)
+            logger.debug("Entered new date answer")
+            return True
+        return False
+
+    def _find_and_handle_dropdown_question(self, section: WebElement) -> bool:
+        try:
+            question = section.find_element(By.CLASS_NAME, 'jobs-easy-apply-form-element')
+
+            dropdowns = question.find_elements(By.TAG_NAME, 'select')
+            if not dropdowns:
+                dropdowns = section.find_elements(By.CSS_SELECTOR, '[data-test-text-entity-list-form-select]')
+
+            if dropdowns:
+                dropdown = dropdowns[0]
+                select = Select(dropdown)
+                options = [option.text for option in select.options]
+
+                logger.debug(f"Dropdown options found: {options}")
+
+                question_text = question.find_element(By.TAG_NAME, 'label').text.lower()
+                logger.debug(f"Processing dropdown or combobox question: {question_text}")
+
+                current_selection = select.first_selected_option.text
+                logger.debug(f"Current selection: {current_selection}")
+
+                existing_answer = None
+                for item in self.all_data:
+                    if self._sanitize_text(question_text) in item['question'] and item['type'] == 'dropdown':
+                        existing_answer = item['answer']
+                        break
+
+                if existing_answer:
+                    logger.debug(f"Found existing answer for question '{question_text}': {existing_answer}")
+                    if current_selection != existing_answer:
+                        logger.debug(f"Updating selection to: {existing_answer}")
+                        self._select_dropdown_option(dropdown, existing_answer)
+                    return True
+
+                logger.debug(f"No existing answer found, querying model for: {question_text}")
+
+                answer = self.gpt_answerer.answer_question_from_options(question_text, options)
+                self._save_questions_to_json({'type': 'dropdown', 'question': question_text, 'answer': answer})
+                self._select_dropdown_option(dropdown, answer)
+                logger.debug(f"Selected new dropdown answer: {answer}")
+                return True
+
+            else:
+
+                logger.debug(f"No dropdown found. Logging elements for debugging.")
+                elements = section.find_elements(By.XPATH, ".//*")
+                logger.debug(f"Elements found: {[element.tag_name for element in elements]}")
+                return False
+
+        except Exception as e:
+            logger.warning(f"Failed to handle dropdown or combobox question: {e}", exc_info=True)
+            return False
+
+    def _is_numeric_field(self, field: WebElement) -> bool:
+        field_type = field.get_attribute('type').lower()
+        field_id = field.get_attribute("id").lower()
+        is_numeric = 'numeric' in field_id or field_type == 'number' or ('text' == field_type and 'numeric' in field_id)
+        logger.debug(f"Field type: {field_type}, Field ID: {field_id}, Is numeric: {is_numeric}")
+        return is_numeric
+
+    def _enter_text(self, element: WebElement, text: str) -> None:
+        logger.debug(f"Entering text: {text}")
+        element.clear()
+        element.send_keys(text)
+
+    def _select_radio(self, radios: List[WebElement], answer: str) -> None:
+        logger.debug(f"Selecting radio option: {answer}")
+        for radio in radios:
+            if answer in radio.text.lower():
+                radio.find_element(By.TAG_NAME, 'label').click()
+                return
+        radios[-1].find_element(By.TAG_NAME, 'label').click()
+
+    def _select_dropdown_option(self, element: WebElement, text: str) -> None:
+        logger.debug(f"Selecting dropdown option: {text}")
+        select = Select(element)
+        select.select_by_visible_text(text)
+
+    def _save_questions_to_json(self, question_data: dict) -> None:
+        output_file = 'answers.json'
+        question_data['question'] = self._sanitize_text(question_data['question'])
+        logger.debug(f"Saving question data to JSON: {question_data}")
+        try:
+            try:
+                with open(output_file, 'r') as f:
+                    try:
+                        data = json.load(f)
+                        if not isinstance(data, list):
+                            raise ValueError("JSON file format is incorrect. Expected a list of questions.")
+                    except json.JSONDecodeError:
+                        logger.error("JSON decoding failed")
+                        data = []
+            except FileNotFoundError:
+                logger.warning("JSON file not found, creating new file")
+                data = []
+            data.append(question_data)
+            with open(output_file, 'w') as f:
+                json.dump(data, f, indent=4)
+            logger.debug("Question data saved successfully to JSON")
+        except Exception:
+            tb_str = traceback.format_exc()
+            logger.error(f"Error saving questions data to JSON file: {tb_str}")
+            raise Exception(f"Error saving questions data to JSON file: \nTraceback:\n{tb_str}")
+
+    def _sanitize_text(self, text: str) -> str:
+        sanitized_text = text.lower().strip().replace('"', '').replace('\\', '')
+        sanitized_text = re.sub(r'[\x00-\x1F\x7F]', '', sanitized_text).replace('\n', ' ').replace('\r', '').rstrip(',')
+        logger.debug(f"Sanitized text: {sanitized_text}")
+        return sanitized_text
+
+
+#src/aihawk_job_manager.py
+
+import json
+import os
+import random
+import time
+from itertools import product
+from pathlib import Path
+
+from inputimeout import inputimeout, TimeoutOccurred
+from selenium.common.exceptions import NoSuchElementException
+from selenium.webdriver.common.by import By
+
+import src.utils as utils
+from app_config import MINIMUM_WAIT_TIME
+from src.job import Job
+from src.aihawk_easy_applier import AIHawkEasyApplier
+from loguru import logger
+import urllib.parse
+
+
+class EnvironmentKeys:
+    def __init__(self):
+        logger.debug("Initializing EnvironmentKeys")
+        self.skip_apply = self._read_env_key_bool("SKIP_APPLY")
+        self.disable_description_filter = self._read_env_key_bool("DISABLE_DESCRIPTION_FILTER")
+        logger.debug(f"EnvironmentKeys initialized: skip_apply={self.skip_apply}, disable_description_filter={self.disable_description_filter}")
+
+    @staticmethod
+    def _read_env_key(key: str) -> str:
+        value = os.getenv(key, "")
+        logger.debug(f"Read environment key {key}: {value}")
+        return value
+
+    @staticmethod
+    def _read_env_key_bool(key: str) -> bool:
+        value = os.getenv(key) == "True"
+        logger.debug(f"Read environment key {key} as bool: {value}")
+        return value
+
+
+class AIHawkJobManager:
+    def __init__(self, driver):
+        logger.debug("Initializing AIHawkJobManager")
+        self.driver = driver
+        self.set_old_answers = set()
+        self.easy_applier_component = None
+        logger.debug("AIHawkJobManager initialized successfully")
+
+    def set_parameters(self, parameters):
+        logger.debug("Setting parameters for AIHawkJobManager")
+        self.company_blacklist = parameters.get('company_blacklist', []) or []
+        self.title_blacklist = parameters.get('title_blacklist', []) or []
+        self.positions = parameters.get('positions', [])
+        self.locations = parameters.get('locations', [])
+        self.apply_once_at_company = parameters.get('apply_once_at_company', False)
+        self.base_search_url = self.get_base_search_url(parameters)
+        self.seen_jobs = []
+
+        job_applicants_threshold = parameters.get('job_applicants_threshold', {})
+        self.min_applicants = job_applicants_threshold.get('min_applicants', 0)
+        self.max_applicants = job_applicants_threshold.get('max_applicants', float('inf'))
+
+        resume_path = parameters.get('uploads', {}).get('resume', None)
+        self.resume_path = Path(resume_path) if resume_path and Path(resume_path).exists() else None
+        self.output_file_directory = Path(parameters['outputFileDirectory'])
+        self.env_config = EnvironmentKeys()
+        logger.debug("Parameters set successfully")
+
+    def set_gpt_answerer(self, gpt_answerer):
+        logger.debug("Setting GPT answerer")
+        self.gpt_answerer = gpt_answerer
+
+    def set_resume_generator_manager(self, resume_generator_manager):
+        logger.debug("Setting resume generator manager")
+        self.resume_generator_manager = resume_generator_manager
+
+    def start_collecting_data(self):
+        searches = list(product(self.positions, self.locations))
+        random.shuffle(searches)
+        page_sleep = 0
+        minimum_time = 60 * 5
+        minimum_page_time = time.time() + minimum_time
+
+        for position, location in searches:
+            location_url = "&location=" + location
+            job_page_number = -1
+            utils.printyellow(f"Collecting data for {position} in {location}.")
+            try:
+                while True:
+                    page_sleep += 1
+                    job_page_number += 1
+                    utils.printyellow(f"Going to job page {job_page_number}")
+                    self.next_job_page(position, location_url, job_page_number)
+                    time.sleep(random.uniform(1.5, 3.5))
+                    utils.printyellow("Starting the collecting process for this page")
+                    self.read_jobs()
+                    utils.printyellow("Collecting data on this page has been completed!")
+
+                    time_left = minimum_page_time - time.time()
+                    if time_left > 0:
+                        utils.printyellow(f"Sleeping for {time_left} seconds.")
+                        time.sleep(time_left)
+                        minimum_page_time = time.time() + minimum_time
+                    if page_sleep % 5 == 0:
+                        sleep_time = random.randint(1, 5)
+                        utils.printyellow(f"Sleeping for {sleep_time / 60} minutes.")
+                        time.sleep(sleep_time)
+                        page_sleep += 1
+            except Exception:
+                pass
+            time_left = minimum_page_time - time.time()
+            if time_left > 0:
+                utils.printyellow(f"Sleeping for {time_left} seconds.")
+                time.sleep(time_left)
+                minimum_page_time = time.time() + minimum_time
+            if page_sleep % 5 == 0:
+                sleep_time = random.randint(50, 90)
+                utils.printyellow(f"Sleeping for {sleep_time / 60} minutes.")
+                time.sleep(sleep_time)
+                page_sleep += 1
+
+    def start_applying(self):
+        logger.debug("Starting job application process")
+        self.easy_applier_component = AIHawkEasyApplier(self.driver, self.resume_path, self.set_old_answers,
+                                                          self.gpt_answerer, self.resume_generator_manager)
+        searches = list(product(self.positions, self.locations))
+        random.shuffle(searches)
+        page_sleep = 0
+        minimum_time = MINIMUM_WAIT_TIME
+        minimum_page_time = time.time() + minimum_time
+
+        for position, location in searches:
+            location_url = "&location=" + location
+            job_page_number = -1
+            logger.debug(f"Starting the search for {position} in {location}.")
+
+            try:
+                while True:
+                    page_sleep += 1
+                    job_page_number += 1
+                    logger.debug(f"Going to job page {job_page_number}")
+                    self.next_job_page(position, location_url, job_page_number)
+                    time.sleep(random.uniform(1.5, 3.5))
+                    logger.debug("Starting the application process for this page...")
+
+                    try:
+                        jobs = self.get_jobs_from_page()
+                        if not jobs:
+                            logger.debug("No more jobs found on this page. Exiting loop.")
+                            break
+                    except Exception as e:
+                        logger.error(f"Failed to retrieve jobs: {e}")
+                        break
+
+                    try:
+                        self.apply_jobs()
+                    except Exception as e:
+                        logger.error(f"Error during job application: {e}")
+                        continue
+
+                    logger.debug("Applying to jobs on this page has been completed!")
+
+                    time_left = minimum_page_time - time.time()
+
+                    # Ask user if they want to skip waiting, with timeout
+                    if time_left > 0:
+                        try:
+                            user_input = inputimeout(
+                                prompt=f"Sleeping for {time_left} seconds. Press 'y' to skip waiting. Timeout 60 seconds : ",
+                                timeout=60).strip().lower()
+                        except TimeoutOccurred:
+                            user_input = ''  # No input after timeout
+                        if user_input == 'y':
+                            logger.debug("User chose to skip waiting.")
+                        else:
+                            logger.debug(f"Sleeping for {time_left} seconds as user chose not to skip.")
+                            time.sleep(time_left)
+
+                    minimum_page_time = time.time() + minimum_time
+
+                    if page_sleep % 5 == 0:
+                        sleep_time = random.randint(5, 34)
+                        try:
+                            user_input = inputimeout(
+                                prompt=f"Sleeping for {sleep_time / 60} minutes. Press 'y' to skip waiting. Timeout 60 seconds : ",
+                                timeout=60).strip().lower()
+                        except TimeoutOccurred:
+                            user_input = ''  # No input after timeout
+                        if user_input == 'y':
+                            logger.debug("User chose to skip waiting.")
+                        else:
+                            logger.debug(f"Sleeping for {sleep_time} seconds.")
+                            time.sleep(sleep_time)
+                        page_sleep += 1
+            except Exception as e:
+                logger.error(f"Unexpected error during job search: {e}")
+                continue
+
+            time_left = minimum_page_time - time.time()
+
+            if time_left > 0:
+                try:
+                    user_input = inputimeout(
+                        prompt=f"Sleeping for {time_left} seconds. Press 'y' to skip waiting. Timeout 60 seconds : ",
+                        timeout=60).strip().lower()
+                except TimeoutOccurred:
+                    user_input = ''  # No input after timeout
+                if user_input == 'y':
+                    logger.debug("User chose to skip waiting.")
+                else:
+                    logger.debug(f"Sleeping for {time_left} seconds as user chose not to skip.")
+                    time.sleep(time_left)
+
+            minimum_page_time = time.time() + minimum_time
+
+            if page_sleep % 5 == 0:
+                sleep_time = random.randint(50, 90)
+                try:
+                    user_input = inputimeout(
+                        prompt=f"Sleeping for {sleep_time / 60} minutes. Press 'y' to skip waiting: ",
+                        timeout=60).strip().lower()
+                except TimeoutOccurred:
+                    user_input = ''  # No input after timeout
+                if user_input == 'y':
+                    logger.debug("User chose to skip waiting.")
+                else:
+                    logger.debug(f"Sleeping for {sleep_time} seconds.")
+                    time.sleep(sleep_time)
+                page_sleep += 1
+
+    def get_jobs_from_page(self):
+
+        try:
+
+            no_jobs_element = self.driver.find_element(By.CLASS_NAME, 'jobs-search-two-pane__no-results-banner--expand')
+            if 'No matching jobs found' in no_jobs_element.text or 'unfortunately, things aren' in self.driver.page_source.lower():
+                logger.debug("No matching jobs found on this page, skipping.")
+                return []
+
+        except NoSuchElementException:
+            pass
+
+        try:
+            job_results = self.driver.find_element(By.CLASS_NAME, "jobs-search-results-list")
+            utils.scroll_slow(self.driver, job_results)
+            utils.scroll_slow(self.driver, job_results, step=300, reverse=True)
+
+            job_list_elements = self.driver.find_elements(By.CLASS_NAME, 'scaffold-layout__list-container')[
+                0].find_elements(By.CLASS_NAME, 'jobs-search-results__list-item')
+            if not job_list_elements:
+                logger.debug("No job class elements found on page, skipping.")
+                return []
+
+            return job_list_elements
+
+        except NoSuchElementException:
+            logger.debug("No job results found on the page.")
+            return []
+
+        except Exception as e:
+            logger.error(f"Error while fetching job elements: {e}")
+            return []
+    def check_job_title(self,job_title: str) -> bool:
+        # List of keywords to check for
+        keywords = ["senior machine learning engineer", 
+                    "machine learning engineer", 
+                    "ai engineer",
+                    "AI/ML",
+                    "ML",
+                    "AI", 
+                    "python", 
+                    "llm",
+                    "Data science",
+                    "data scientist"
+                    "Data Engineer",
+                    "High Frequency Trading",
+                    "Quant Trading",
+                    "Quant Developer",
+                    "Lead ML Engineer",
+                    "Data engineer Python LLM",
+                    "Senior Machine Learning Engineer"]
+
+        # Normalize the job title to lowercase for case-insensitive comparison
+        job_title_lower = job_title.lower()
+        # Check if any of the keywords are present in the job title
+        return any(keyword.lower() in job_title_lower for keyword in keywords)
+
+    def read_jobs(self):
+        try:
+            no_jobs_element = self.driver.find_element(By.CLASS_NAME, 'jobs-search-two-pane__no-results-banner--expand')
+            if 'No matching jobs found' in no_jobs_element.text or 'unfortunately, things aren' in self.driver.page_source.lower():
+                raise Exception("No more jobs on this page")
+        except NoSuchElementException:
+            pass
+        
+        job_results = self.driver.find_element(By.CLASS_NAME, "jobs-search-results-list")
+        utils.scroll_slow(self.driver, job_results)
+        utils.scroll_slow(self.driver, job_results, step=300, reverse=True)
+        job_list_elements = self.driver.find_elements(By.CLASS_NAME, 'scaffold-layout__list-container')[0].find_elements(By.CLASS_NAME, 'jobs-search-results__list-item')
+        if not job_list_elements:
+            raise Exception("No job class elements found on page")
+        job_list = [Job(*self.extract_job_information_from_tile(job_element)) for job_element in job_list_elements] 
+        for job in job_list:            
+            if self.is_blacklisted(job.title, job.company, job.link):
+                utils.printyellow(f"Blacklisted {job.title} at {job.company}, skipping...")
+                self.write_to_file(job, "skipped")
+                continue
+            try:
+                self.write_to_file(job,'data')
+            except Exception as e:
+                self.write_to_file(job, "failed")
+                continue
+
+    def apply_jobs(self):
+        try:
+            no_jobs_element = self.driver.find_element(By.CLASS_NAME, 'jobs-search-two-pane__no-results-banner--expand')
+            if 'No matching jobs found' in no_jobs_element.text or 'unfortunately, things aren' in self.driver.page_source.lower():
+                logger.debug("No matching jobs found on this page, skipping")
+                return
+        except NoSuchElementException:
+            pass
+
+        job_list_elements = self.driver.find_elements(By.CLASS_NAME, 'scaffold-layout__list-container')[
+            0].find_elements(By.CLASS_NAME, 'jobs-search-results__list-item')
+
+        if not job_list_elements:
+            logger.debug("No job class elements found on page, skipping")
+            return
+
+        job_list = [Job(*self.extract_job_information_from_tile(job_element)) for job_element in job_list_elements]
+
+        for job in job_list:
+
+            logger.debug(f"Starting applicant for job: {job.title} at {job.company}")
+            #TODO fix apply threshold
+            """
+                # Initialize applicants_count as None
+                applicants_count = None
+
+                # Iterate over each job insight element to find the one containing the word "applicant"
+                for element in job_insight_elements:
+                    logger.debug(f"Checking element text: {element.text}")
+                    if "applicant" in element.text.lower():
+                        # Found an element containing "applicant"
+                        applicants_text = element.text.strip()
+                        logger.debug(f"Applicants text found: {applicants_text}")
+
+                        # Extract numeric digits from the text (e.g., "70 applicants" -> "70")
+                        applicants_count = ''.join(filter(str.isdigit, applicants_text))
+                        logger.debug(f"Extracted applicants count: {applicants_count}")
+
+                        if applicants_count:
+                            if "over" in applicants_text.lower():
+                                applicants_count = int(applicants_count) + 1  # Handle "over X applicants"
+                                logger.debug(f"Applicants count adjusted for 'over': {applicants_count}")
+                            else:
+                                applicants_count = int(applicants_count)  # Convert the extracted number to an integer
+                        break
+
+                # Check if applicants_count is valid (not None) before performing comparisons
+                if applicants_count is not None:
+                    # Perform the threshold check for applicants count
+                    if applicants_count < self.min_applicants or applicants_count > self.max_applicants:
+                        logger.debug(f"Skipping {job.title} at {job.company}, applicants count: {applicants_count}")
+                        self.write_to_file(job, "skipped_due_to_applicants")
+                        continue  # Skip this job if applicants count is outside the threshold
+                    else:
+                        logger.debug(f"Applicants count {applicants_count} is within the threshold")
+                else:
+                    # If no applicants count was found, log a warning but continue the process
+                    logger.warning(
+                        f"Applicants count not found for {job.title} at {job.company}, continuing with application.")
+            except NoSuchElementException:
+                # Log a warning if the job insight elements are not found, but do not stop the job application process
+                logger.warning(
+                    f"Applicants count elements not found for {job.title} at {job.company}, continuing with application.")
+            except ValueError as e:
+                # Handle errors when parsing the applicants count
+                logger.error(f"Error parsing applicants count for {job.title} at {job.company}: {e}")
+            except Exception as e:
+                # Catch any other exceptions to ensure the process continues
+                logger.error(
+                    f"Unexpected error during applicants count processing for {job.title} at {job.company}: {e}")
+
+            # Continue with the job application process regardless of the applicants count check
+            """
+        
+
+            if self.is_blacklisted(job.title, job.company, job.link):
+                logger.debug(f"Job blacklisted: {job.title} at {job.company}")
+                self.write_to_file(job, "skipped")
+                continue
+            if self.is_already_applied_to_job(job.title, job.company, job.link):
+                self.write_to_file(job, "skipped")
+                continue
+            if self.is_already_applied_to_company(job.company):
+                self.write_to_file(job, "skipped")
+                continue
+            try:
+                if job.apply_method not in {"Continue", "Applied", "Apply"}:
+                    if self.check_job_title(job.title) == True:
+                        self.easy_applier_component.job_apply(job)
+                        self.write_to_file(job, "success")
+                        logger.debug(f"Applied to job: {job.title} at {job.company}")
+                    else:
+                        utils.printyellow(f"Job Keyword didn't match {job.title} at {job.company}, skipping...")
+                        self.write_to_file(job, "skipped")
+            except Exception as e:
+                logger.error(f"Failed to apply for {job.title} at {job.company}: {e}")
+                self.write_to_file(job, "failed")
+                continue
+
+    def write_to_file(self, job, file_name):
+        logger.debug(f"Writing job application result to file: {file_name}")
+        pdf_path = Path(job.pdf_path).resolve()
+        pdf_path = pdf_path.as_uri()
+        data = {
+            "company": job.company,
+            "job_title": job.title,
+            "link": job.link,
+            "job_recruiter": job.recruiter_link,
+            "job_location": job.location,
+            "pdf_path": pdf_path
+        }
+        file_path = self.output_file_directory / f"{file_name}.json"
+        if not file_path.exists():
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump([data], f, indent=4)
+                logger.debug(f"Job data written to new file: {file_name}")
+        else:
+            with open(file_path, 'r+', encoding='utf-8') as f:
+                try:
+                    existing_data = json.load(f)
+                except json.JSONDecodeError:
+                    logger.error(f"JSON decode error in file: {file_path}")
+                    existing_data = []
+                existing_data.append(data)
+                f.seek(0)
+                json.dump(existing_data, f, indent=4)
+                f.truncate()
+                logger.debug(f"Job data appended to existing file: {file_name}")
+
+    def get_base_search_url(self, parameters):
+        logger.debug("Constructing base search URL")
+        url_parts = []
+        if parameters['remote']:
+            url_parts.append("f_CF=f_WRA")
+        experience_levels = [str(i + 1) for i, (level, v) in enumerate(parameters.get('experience_level', {}).items()) if
+                             v]
+        if experience_levels:
+            url_parts.append(f"f_E={','.join(experience_levels)}")
+        url_parts.append(f"distance={parameters['distance']}")
+        job_types = [key[0].upper() for key, value in parameters.get('jobTypes', {}).items() if value]
+        if job_types:
+            url_parts.append(f"f_JT={','.join(job_types)}")
+        date_mapping = {
+            "all time": "",
+            "month": "&f_TPR=r2592000",
+            "week": "&f_TPR=r604800",
+            "24 hours": "&f_TPR=r86400"
+        }
+        date_param = next((v for k, v in date_mapping.items() if parameters.get('date', {}).get(k)), "")
+        url_parts.append("f_LF=f_AL")  # Easy Apply
+        base_url = "&".join(url_parts)
+        full_url = f"?{base_url}{date_param}"
+        logger.debug(f"Base search URL constructed: {full_url}")
+        return full_url
+
+    def next_job_page(self, position, location, job_page):
+        logger.debug(f"Navigating to next job page: {position} in {location}, page {job_page}")
+        encoded_position = urllib.parse.quote(position)
+        self.driver.get(
+            f"https://www.linkedin.com/jobs/search/{self.base_search_url}&keywords={encoded_position}{location}&start={job_page * 25}")
+
+    def extract_job_information_from_tile(self, job_tile):
+        logger.debug("Extracting job information from tile")
+        job_title, company, job_location, apply_method, link = "", "", "", "", ""
+        try:
+            print(job_tile.get_attribute('outerHTML'))
+            job_title = job_tile.find_element(By.CLASS_NAME, 'job-card-list__title').find_element(By.TAG_NAME, 'strong').text
+            
+            link = job_tile.find_element(By.CLASS_NAME, 'job-card-list__title').get_attribute('href').split('?')[0]
+            company = job_tile.find_element(By.CLASS_NAME, 'job-card-container__primary-description').text
+            logger.debug(f"Job information extracted: {job_title} at {company}")
+        except NoSuchElementException:
+            logger.warning("Some job information (title, link, or company) is missing.")
+        try:
+            job_location = job_tile.find_element(By.CLASS_NAME, 'job-card-container__metadata-item').text
+        except NoSuchElementException:
+            logger.warning("Job location is missing.")
+        try:
+            apply_method = job_tile.find_element(By.CLASS_NAME, 'job-card-container__apply-method').text
+        except NoSuchElementException:
+            apply_method = "Applied"
+            logger.warning("Apply method not found, assuming 'Applied'.")
+
+        return job_title, company, job_location, link, apply_method
+
+    def is_blacklisted(self, job_title, company, link):
+        logger.debug(f"Checking if job is blacklisted: {job_title} at {company}")
+        job_title_words = job_title.lower().split(' ')
+        title_blacklisted = any(word in job_title_words for word in self.title_blacklist)
+        company_blacklisted = company.strip().lower() in (word.strip().lower() for word in self.company_blacklist)
+        link_seen = link in self.seen_jobs
+        is_blacklisted = title_blacklisted or company_blacklisted or link_seen
+        logger.debug(f"Job blacklisted status: {is_blacklisted}")
+
+        return title_blacklisted or company_blacklisted or link_seen
+
+    def is_already_applied_to_job(self, job_title, company, link):
+        link_seen = link in self.seen_jobs
+        if link_seen:
+            logger.debug(f"Already applied to job: {job_title} at {company}, skipping...")
+        return link_seen
+
+    def is_already_applied_to_company(self, company):
+        if not self.apply_once_at_company:
+            return False
+
+        output_files = ["success.json"]
+        for file_name in output_files:
+            file_path = self.output_file_directory / file_name
+            if file_path.exists():
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    try:
+                        existing_data = json.load(f)
+                        for applied_job in existing_data:
+                            if applied_job['company'].strip().lower() == company.strip().lower():
+                                logger.debug(
+                                    f"Already applied at {company} (once per company policy), skipping...")
+                                return True
+                    except json.JSONDecodeError:
+                        continue
+        return False
+
+
+
+#src/job.py
+
+from dataclasses import dataclass
+
+from loguru import logger
+
+
+@dataclass
+class Job:
+    title: str
+    company: str
+    location: str
+    link: str
+    apply_method: str
+    description: str = ""
+    summarize_job_description: str = ""
+    pdf_path: str = ""
+    recruiter_link: str = ""
+
+    def set_summarize_job_description(self, summarize_job_description):
+        logger.debug(f"Setting summarized job description: {summarize_job_description}")
+        self.summarize_job_description = summarize_job_description
+
+    def set_job_description(self, description):
+        logger.debug(f"Setting job description: {description}")
+        self.description = description
+
+    def set_recruiter_link(self, recruiter_link):
+        logger.debug(f"Setting recruiter link: {recruiter_link}")
+        self.recruiter_link = recruiter_link
+
+    def formatted_job_information(self):
+        """
+        Formats the job information as a markdown string.
+        """
+        logger.debug(f"Formatting job information for job: {self.title} at {self.company}")
+        job_information = f"""
+        # Job Description
+        ## Job Information 
+        - Position: {self.title}
+        - At: {self.company}
+        - Location: {self.location}
+        - Recruiter Profile: {self.recruiter_link or 'Not available'}
+        
+        ## Description
+        {self.description or 'No description provided.'}
+        """
+        formatted_information = job_information.strip()
+        logger.debug(f"Formatted job information: {formatted_information}")
+        return formatted_information
+
+
+#src/job_application_profile.py
+
+from dataclasses import dataclass
+
+import yaml
+
+from loguru import logger
+
+
+@dataclass
+class SelfIdentification:
+    gender: str
+    pronouns: str
+    veteran: str
+    disability: str
+    ethnicity: str
+
+
+@dataclass
+class LegalAuthorization:
+    eu_work_authorization: str
+    us_work_authorization: str
+    requires_us_visa: str
+    legally_allowed_to_work_in_us: str
+    requires_us_sponsorship: str
+    requires_eu_visa: str
+    legally_allowed_to_work_in_eu: str
+    requires_eu_sponsorship: str
+    canada_work_authorization: str
+    requires_canada_visa: str
+    legally_allowed_to_work_in_canada: str
+    requires_canada_sponsorship: str
+    uk_work_authorization: str
+    requires_uk_visa: str 
+    legally_allowed_to_work_in_uk: str
+    requires_uk_sponsorship: str
+
+
+
+@dataclass
+class WorkPreferences:
+    remote_work: str
+    in_person_work: str
+    open_to_relocation: str
+    willing_to_complete_assessments: str
+    willing_to_undergo_drug_tests: str
+    willing_to_undergo_background_checks: str
+
+
+@dataclass
+class Availability:
+    notice_period: str
+
+
+@dataclass
+class SalaryExpectations:
+    salary_range_usd: str
+
+
+@dataclass
+class JobApplicationProfile:
+    self_identification: SelfIdentification
+    legal_authorization: LegalAuthorization
+    work_preferences: WorkPreferences
+    availability: Availability
+    salary_expectations: SalaryExpectations
+
+    def __init__(self, yaml_str: str):
+        logger.debug("Initializing JobApplicationProfile with provided YAML string")
+        try:
+            data = yaml.safe_load(yaml_str)
+            logger.debug(f"YAML data successfully parsed: {data}")
+        except yaml.YAMLError as e:
+            logger.error(f"Error parsing YAML file: {e}")
+            raise ValueError("Error parsing YAML file.") from e
+        except Exception as e:
+            logger.error(f"Unexpected error occurred while parsing the YAML file: {e}")
+            raise RuntimeError("An unexpected error occurred while parsing the YAML file.") from e
+
+        if not isinstance(data, dict):
+            logger.error(f"YAML data must be a dictionary, received: {type(data)}")
+            raise TypeError("YAML data must be a dictionary.")
+
+        # Process self_identification
+        try:
+            logger.debug("Processing self_identification")
+            self.self_identification = SelfIdentification(**data['self_identification'])
+            logger.debug(f"self_identification processed: {self.self_identification}")
+        except KeyError as e:
+            logger.error(f"Required field {e} is missing in self_identification data.")
+            raise KeyError(f"Required field {e} is missing in self_identification data.") from e
+        except TypeError as e:
+            logger.error(f"Error in self_identification data: {e}")
+            raise TypeError(f"Error in self_identification data: {e}") from e
+        except AttributeError as e:
+            logger.error(f"Attribute error in self_identification processing: {e}")
+            raise AttributeError("Attribute error in self_identification processing.") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while processing self_identification: {e}")
+            raise RuntimeError("An unexpected error occurred while processing self_identification.") from e
+
+        # Process legal_authorization
+        try:
+            logger.debug("Processing legal_authorization")
+            self.legal_authorization = LegalAuthorization(**data['legal_authorization'])
+            logger.debug(f"legal_authorization processed: {self.legal_authorization}")
+        except KeyError as e:
+            logger.error(f"Required field {e} is missing in legal_authorization data.")
+            raise KeyError(f"Required field {e} is missing in legal_authorization data.") from e
+        except TypeError as e:
+            logger.error(f"Error in legal_authorization data: {e}")
+            raise TypeError(f"Error in legal_authorization data: {e}") from e
+        except AttributeError as e:
+            logger.error(f"Attribute error in legal_authorization processing: {e}")
+            raise AttributeError("Attribute error in legal_authorization processing.") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while processing legal_authorization: {e}")
+            raise RuntimeError("An unexpected error occurred while processing legal_authorization.") from e
+
+        # Process work_preferences
+        try:
+            logger.debug("Processing work_preferences")
+            self.work_preferences = WorkPreferences(**data['work_preferences'])
+            logger.debug(f"Work_preferences processed: {self.work_preferences}")
+        except KeyError as e:
+            logger.error(f"Required field {e} is missing in work_preferences data.")
+            raise KeyError(f"Required field {e} is missing in work_preferences data.") from e
+        except TypeError as e:
+            logger.error(f"Error in work_preferences data: {e}")
+            raise TypeError(f"Error in work_preferences data: {e}") from e
+        except AttributeError as e:
+            logger.error(f"Attribute error in work_preferences processing: {e}")
+            raise AttributeError("Attribute error in work_preferences processing.") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while processing work_preferences: {e}")
+            raise RuntimeError("An unexpected error occurred while processing work_preferences.") from e
+
+        # Process availability
+        try:
+            logger.debug("Processing availability")
+            self.availability = Availability(**data['availability'])
+            logger.debug(f"Availability processed: {self.availability}")
+        except KeyError as e:
+            logger.error(f"Required field {e} is missing in availability data.")
+            raise KeyError(f"Required field {e} is missing in availability data.") from e
+        except TypeError as e:
+            logger.error(f"Error in availability data: {e}")
+            raise TypeError(f"Error in availability data: {e}") from e
+        except AttributeError as e:
+            logger.error(f"Attribute error in availability processing: {e}")
+            raise AttributeError("Attribute error in availability processing.") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while processing availability: {e}")
+            raise RuntimeError("An unexpected error occurred while processing availability.") from e
+
+        # Process salary_expectations
+        try:
+            logger.debug("Processing salary_expectations")
+            self.salary_expectations = SalaryExpectations(**data['salary_expectations'])
+            logger.debug(f"salary_expectations processed: {self.salary_expectations}")
+        except KeyError as e:
+            logger.error(f"Required field {e} is missing in salary_expectations data.")
+            raise KeyError(f"Required field {e} is missing in salary_expectations data.") from e
+        except TypeError as e:
+            logger.error(f"Error in salary_expectations data: {e}")
+            raise TypeError(f"Error in salary_expectations data: {e}") from e
+        except AttributeError as e:
+            logger.error(f"Attribute error in salary_expectations processing: {e}")
+            raise AttributeError("Attribute error in salary_expectations processing.") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while processing salary_expectations: {e}")
+            raise RuntimeError("An unexpected error occurred while processing salary_expectations.") from e
+
+        logger.debug("JobApplicationProfile initialization completed successfully.")
+
+    def __str__(self):
+        logger.debug("Generating string representation of JobApplicationProfile")
+
+        def format_dataclass(obj):
+            return "\n".join(f"{field.name}: {getattr(obj, field.name)}" for field in obj.__dataclass_fields__.values())
+
+        formatted_str = (f"Self Identification:\n{format_dataclass(self.self_identification)}\n\n"
+                         f"Legal Authorization:\n{format_dataclass(self.legal_authorization)}\n\n"
+                         f"Work Preferences:\n{format_dataclass(self.work_preferences)}\n\n"
+                         f"Availability: {self.availability.notice_period}\n\n"
+                         f"Salary Expectations: {self.salary_expectations.salary_range_usd}\n\n")
+        logger.debug(f"String representation generated: {formatted_str}")
+        return formatted_str
+
+
+#src/strings.py
+
+# Personal Information Template
+personal_information_template = """
+Answer the following question based on the provided personal information.
+
+## Rules
+- Answer questions directly.
+
+## Example
+My resume: John Doe, born on 01/01/1990, living in Milan, Italy.
+Question: What is your city?
+ Milan
+
+Personal Information: {resume_section}
+Question: {question}
+"""
+
+# Self Identification Template
+self_identification_template = """
+Answer the following question based on the provided self-identification details.
+
+## Rules
+- Answer questions directly.
+
+## Example
+My resume: Male, uses he/him pronouns, not a veteran, no disability.
+Question: What are your gender?
+Male
+
+Self-Identification: {resume_section}
+Question: {question}
+"""
+
+# Legal Authorization Template
+legal_authorization_template = """
+Answer the following question based on the provided legal authorization details.
+
+## Rules
+- Answer questions directly.
+
+## Example
+My resume: Authorized to work in the EU, no US visa required.
+Question: Are you legally allowed to work in the EU?
+Yes
+
+Legal Authorization: {resume_section}
+Question: {question}
+"""
+
+# Work Preferences Template
+work_preferences_template = """
+Answer the following question based on the provided work preferences.
+
+## Rules
+- Answer questions directly.
+
+## Example
+My resume: Open to remote work, willing to relocate.
+Question: Are you open to remote work?
+Yes
+
+Work Preferences: {resume_section}
+Question: {question}
+"""
+
+# Education Details Template
+education_details_template = """
+Answer the following question based on the provided education details.
+
+## Rules
+- Answer questions directly.
+- If it seems likely that you have the experience, even if not explicitly defined, answer as if you have the experience.
+- If unsure, respond with "I have no experience with that, but I learn fast" or "Not yet, but willing to learn."
+- Keep the answer under 140 characters.
+
+## Example
+My resume: Bachelor's degree in Computer Science with experience in Python.
+Question: Do you have experience with Python?
+Yes, I have experience with Python.
+
+Education Details: {resume_section}
+Question: {question}
+"""
+
+# Experience Details Template
+experience_details_template = """
+Answer the following question based on the provided experience details.
+
+## Rules
+- Answer questions directly.
+- If it seems likely that you have the experience, even if not explicitly defined, answer as if you have the experience.
+- If unsure, respond with "I have no experience with that, but I learn fast" or "Not yet, but willing to learn."
+- Keep the answer under 140 characters.
+
+## Example
+My resume: 3 years as a software developer with leadership experience.
+Question: Do you have leadership experience?
+Yes, I have 3 years of leadership experience.
+
+Experience Details: {resume_section}
+Question: {question}
+"""
+
+# Projects Template
+projects_template = """
+Answer the following question based on the provided project details.
+
+## Rules
+- Answer questions directly.
+- If it seems likely that you have the experience, even if not explicitly defined, answer as if you have the experience.
+- Keep the answer under 140 characters.
+
+## Example
+My resume: Led the development of a mobile app, repository available.
+Question: Have you led any projects?
+Yes, led the development of a mobile app
+
+Projects: {resume_section}
+Question: {question}
+"""
+
+# Availability Template
+availability_template = """
+Answer the following question based on the provided availability details.
+
+## Rules
+- Answer questions directly.
+- Keep the answer under 140 characters.
+- Use periods only if the answer has multiple sentences.
+
+## Example
+My resume: Available to start immediately.
+Question: When can you start?
+I can start immediately.
+
+Availability: {resume_section}
+Question: {question}
+"""
+
+# Salary Expectations Template
+salary_expectations_template = """
+Answer the following question based on the provided salary expectations.
+
+## Rules
+- Answer questions directly.
+- Keep the answer under 140 characters.
+- Use periods only if the answer has multiple sentences.
+
+## Example
+My resume: Looking for a salary in the range of 50k-60k USD.
+Question: What are your salary expectations?
+55000.
+
+Salary Expectations: {resume_section}
+Question: {question}
+"""
+
+# Certifications Template
+certifications_template = """
+Answer the following question based on the provided certifications.
+
+## Rules
+- Answer questions directly.
+- If it seems likely that you have the experience, even if not explicitly defined, answer as if you have the experience.
+- If unsure, respond with "I have no experience with that, but I learn fast" or "Not yet, but willing to learn."
+- Keep the answer under 140 characters.
+
+## Example
+My resume: Certified in Project Management Professional (PMP).
+Question: Do you have PMP certification?
+Yes, I am PMP certified.
+
+Certifications: {resume_section}
+Question: {question}
+"""
+
+# Languages Template
+languages_template = """
+Answer the following question based on the provided language skills.
+
+## Rules
+- Answer questions directly.
+- If it seems likely that you have the experience, even if not explicitly defined, answer as if you have the experience.
+- If unsure, respond with "I have no experience with that, but I learn fast" or "Not yet, but willing to learn."
+- Keep the answer under 140 characters. Do not add any additional languages what is not in my experience
+
+## Example
+My resume: Fluent in Italian and English.
+Question: What languages do you speak?
+Fluent in Italian and English.
+
+Languages: {resume_section}
+Question: {question}
+"""
+
+# Interests Template
+interests_template = """
+Answer the following question based on the provided interests.
+
+## Rules
+- Answer questions directly.
+- Keep the answer under 140 characters.
+- Use periods only if the answer has multiple sentences.
+
+## Example
+My resume: Interested in AI and data science.
+Question: What are your interests?
+AI and data science.
+
+Interests: {resume_section}
+Question: {question}
+"""
+
+summarize_prompt_template = """
+As a seasoned HR expert, your task is to identify and outline the key skills and requirements necessary for the position of this job. Use the provided job description as input to extract all relevant information. This will involve conducting a thorough analysis of the job's responsibilities and the industry standards. You should consider both the technical and soft skills needed to excel in this role. Additionally, specify any educational qualifications, certifications, or experiences that are essential. Your analysis should also reflect on the evolving nature of this role, considering future trends and how they might affect the required competencies.
+
+Rules:
+Remove boilerplate text
+Include only relevant information to match the job description against the resume
+
+# Analysis Requirements
+Your analysis should include the following sections:
+Technical Skills: List all the specific technical skills required for the role based on the responsibilities described in the job description.
+Soft Skills: Identify the necessary soft skills, such as communication abilities, problem-solving, time management, etc.
+Educational Qualifications and Certifications: Specify the essential educational qualifications and certifications for the role.
+Professional Experience: Describe the relevant work experiences that are required or preferred.
+Role Evolution: Analyze how the role might evolve in the future, considering industry trends and how these might influence the required skills.
+
+# Final Result:
+Your analysis should be structured in a clear and organized document with distinct sections for each of the points listed above. Each section should contain:
+This comprehensive overview will serve as a guideline for the recruitment process, ensuring the identification of the most qualified candidates.
+
+# Job Description:
+```
+{text}
+```
+
+---
+
+# Job Description Summary"""
+
+coverletter_template = """
+Compose a brief and impactful cover letter based on the provided job description and resume. The letter should be no longer than three paragraphs and should be written in a professional, yet conversational tone. Avoid using any placeholders, and ensure that the letter flows naturally and is tailored to the job.
+
+Analyze the job description to identify key qualifications and requirements. Introduce the candidate succinctly, aligning their career objectives with the role. Highlight relevant skills and experiences from the resume that directly match the job’s demands, using specific examples to illustrate these qualifications. Reference notable aspects of the company, such as its mission or values, that resonate with the candidate’s professional goals. Conclude with a strong statement of why the candidate is a good fit for the position, expressing a desire to discuss further.
+
+Please write the cover letter in a way that directly addresses the job role and the company’s characteristics, ensuring it remains concise and engaging without unnecessary embellishments. The letter should be formatted into paragraphs and should not include a greeting or signature.
+
+## Rules:
+- Provide only the text of the cover letter.
+- Do not include any introductions, explanations, or additional information.
+- The letter should be formatted into paragraph.
+
+## Job Description:
+```
+{job_description}
+```
+## My resume:
+```
+{resume}
+```
+"""
+
+numeric_question_template = """
+Read the following resume carefully and answer the specific questions regarding the candidate's experience with a number of years. Follow these strategic guidelines when responding:
+
+1. **Related and Inferred Experience:**
+   - **Similar Technologies:** If experience with a specific technology is not explicitly stated, but the candidate has experience with similar or related technologies, provide a plausible number of years reflecting this related experience. For instance, if the candidate has experience with Python and projects involving technologies similar to Java, estimate a reasonable number of years for Java.
+   - **Projects and Studies:** Examine the candidate’s projects and studies to infer skills not explicitly mentioned. Complex and advanced projects often indicate deeper expertise.
+
+2. **Indirect Experience and Academic Background:**
+   - **Type of University and Studies:** Consider the type of university and course followed.
+   - **Exam Grades:** Consider exam grades achieved. High grades in relevant subjects can indicate stronger proficiency and understanding.
+   - **Relevant thesis:** Consider the thesis of the candidate has worked. Advanced projects suggest deeper skills.
+   - **Roles and Responsibilities:** Evaluate the roles and responsibilities held to estimate experience with specific technologies or skills.
+
+
+3. **Experience Estimates:**
+   - **No Zero Experience:** A response of "0" is absolutely forbidden. If direct experience cannot be confirmed, provide a minimum of "2" years based on inferred or related experience.
+   - **For Low Experience (up to 5 years):** Estimate experience based on inferred bacherol, skills and projects, always providing at least "2" years when relevant.
+   - **For High Experience:** For high levels of experience, provide a number based on clear evidence from the resume. Avoid making inferences for high experience levels unless the evidence is strong.
+
+4. **Rules:**
+   - Answer the question directly with a number, avoiding "0" entirely.
+
+## Example 1
+```
+## Curriculum
+
+I had a degree in computer science. I have worked  years with  MQTT protocol.
+
+## Question
+
+How many years of experience do you have with IoT?
+
+## Answer
+
+4
+```
+## Example 1
+```
+## Curriculum
+
+I had a degree in computer science. 
+
+## Question
+
+How many years of experience do you have with Bash?
+
+## Answer
+
+2
+```
+
+## Example 2
+```
+## Curriculum
+
+I am a software engineer with 5 years of experience in Swift and Python. I have worked on an AI project.
+
+## Question
+
+How many years of experience do you have with AI?
+
+## Answer
+
+2
+```
+
+## Resume:
+```
+{resume_educations}
+{resume_jobs}
+{resume_projects}
+```
+        
+## Question:
+{question}
+
+---
+
+When responding, consider all available information, including projects, work experience, and academic background, to provide an accurate and well-reasoned answer. Make every effort to infer relevant experience and avoid defaulting to 0 if any related experience can be estimated.
+
+"""
+
+options_template = """The following is a resume and an answered question about the resume, the answer is one of the options.
+
+## Rules
+- Never choose the default/placeholder option, examples are: 'Select an option', 'None', 'Choose from the options below', etc.
+- The answer must be one of the options.
+- The answer must exclusively contain one of the options.
+
+## Example
+My resume: I'm a software engineer with 10 years of experience on swift, python, C, C++.
+Question: How many years of experience do you have on python?
+Options: [1-2, 3-5, 6-10, 10+]
+10+
+
+-----
+
+## My resume:
+```
+{resume}
+```
+
+## Question:
+{question}
+
+## Options:
+{options}
+
+## """
+
+try_to_fix_template = """\
+The objective is to fix the text of a form input on a web page.
+
+## Rules
+- Use the error to fix the original text.
+- The error "Please enter a valid answer" usually means the text is too large, shorten the reply to less than a tweet.
+- For errors like "Enter a whole number between 3 and 30", just need a number.
+
+-----
+
+## Form Question
+{question}
+
+## Input
+{input} 
+
+## Error
+{error}  
+
+## Fixed Input
+"""
+
+func_summarize_prompt_template = """
+        Following are two texts, one with placeholders and one without, the second text uses information from the first text to fill the placeholders.
+        
+        ## Rules
+        - A placeholder is a string like "[[placeholder]]". E.g. "[[company]]", "[[job_title]]", "[[years_of_experience]]"...
+        - The task is to remove the placeholders from the text.
+        - If there is no information to fill a placeholder, remove the placeholder, and adapt the text accordingly.
+        - No placeholders should remain in the text.
+        
+        ## Example
+        Text with placeholders: "I'm a software engineer engineer with 10 years of experience on [placeholder] and [placeholder]."
+        Text without placeholders: "I'm a software engineer with 10 years of experience."
+        
+        -----
+        
+        ## Text with placeholders:
+        {text_with_placeholders}
+        
+        ## Text without placeholders:"""
+
+
+#src/utils.py
+
+import logging
+import os
+import random
+import sys
+import time
+
+from selenium import webdriver
+from loguru import logger
+
+from app_config import MINIMUM_LOG_LEVEL
+
+log_file = "app_log.log"
+
+
+if MINIMUM_LOG_LEVEL in ["DEBUG", "TRACE", "INFO", "WARNING", "ERROR", "CRITICAL"]:
+    logger.remove()
+    logger.add(sys.stderr, level=MINIMUM_LOG_LEVEL)
+else:
+    logger.warning(f"Invalid log level: {MINIMUM_LOG_LEVEL}. Defaulting to DEBUG.")
+    logger.remove()
+    logger.add(sys.stderr, level="DEBUG")
+
+chromeProfilePath = os.path.join(os.getcwd(), "chrome_profile", "linkedin_profile")
+
+def ensure_chrome_profile():
+    logger.debug(f"Ensuring Chrome profile exists at path: {chromeProfilePath}")
+    profile_dir = os.path.dirname(chromeProfilePath)
+    if not os.path.exists(profile_dir):
+        os.makedirs(profile_dir)
+        logger.debug(f"Created directory for Chrome profile: {profile_dir}")
+    if not os.path.exists(chromeProfilePath):
+        os.makedirs(chromeProfilePath)
+        logger.debug(f"Created Chrome profile directory: {chromeProfilePath}")
+    return chromeProfilePath
+
+
+def is_scrollable(element):
+    scroll_height = element.get_attribute("scrollHeight")
+    client_height = element.get_attribute("clientHeight")
+    scrollable = int(scroll_height) > int(client_height)
+    logger.debug(f"Element scrollable check: scrollHeight={scroll_height}, clientHeight={client_height}, scrollable={scrollable}")
+    return scrollable
+
+
+def scroll_slow(driver, scrollable_element, start=0, end=3600, step=300, reverse=False):
+    logger.debug(f"Starting slow scroll: start={start}, end={end}, step={step}, reverse={reverse}")
+
+    if reverse:
+        start, end = end, start
+        step = -step
+
+    if step == 0:
+        logger.error("Step value cannot be zero.")
+        raise ValueError("Step cannot be zero.")
+
+    max_scroll_height = int(scrollable_element.get_attribute("scrollHeight"))
+    current_scroll_position = int(float(scrollable_element.get_attribute("scrollTop")))
+    logger.debug(f"Max scroll height of the element: {max_scroll_height}")
+    logger.debug(f"Current scroll position: {current_scroll_position}")
+
+    if reverse:
+        if current_scroll_position < start:
+            start = current_scroll_position
+        logger.debug(f"Adjusted start position for upward scroll: {start}")
+    else:
+        if end > max_scroll_height:
+            logger.warning(f"End value exceeds the scroll height. Adjusting end to {max_scroll_height}")
+            end = max_scroll_height
+
+    script_scroll_to = "arguments[0].scrollTop = arguments[1];"
+
+    try:
+        if scrollable_element.is_displayed():
+            if not is_scrollable(scrollable_element):
+                logger.warning("The element is not scrollable.")
+                return
+
+            if (step > 0 and start >= end) or (step < 0 and start <= end):
+                logger.warning("No scrolling will occur due to incorrect start/end values.")
+                return
+
+            position = start
+            previous_position = None  # Tracking the previous position to avoid duplicate scrolls
+            while (step > 0 and position < end) or (step < 0 and position > end):
+                if position == previous_position:
+                    # Avoid re-scrolling to the same position
+                    logger.debug(f"Stopping scroll as position hasn't changed: {position}")
+                    break
+
+                try:
+                    driver.execute_script(script_scroll_to, scrollable_element, position)
+                    logger.debug(f"Scrolled to position: {position}")
+                except Exception as e:
+                    logger.error(f"Error during scrolling: {e}")
+
+                previous_position = position
+                position += step
+
+                # Decrease the step but ensure it doesn't reverse direction
+                step = max(10, abs(step) - 10) * (-1 if reverse else 1)
+
+                time.sleep(random.uniform(0.6, 1.5))
+
+            # Ensure the final scroll position is correct
+            driver.execute_script(script_scroll_to, scrollable_element, end)
+            logger.debug(f"Scrolled to final position: {end}")
+            time.sleep(0.5)
+        else:
+            logger.warning("The element is not visible.")
+    except Exception as e:
+        logger.error(f"Exception occurred during scrolling: {e}")
+
+
+def chrome_browser_options():
+    logger.debug("Setting Chrome browser options")
+    ensure_chrome_profile()
+    options = webdriver.ChromeOptions()
+    options.add_argument("--start-maximized")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-gpu")
+    options.add_argument("window-size=1200x800")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-translate")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--disable-logging")
+    options.add_argument("--disable-autofill")
+    options.add_argument("--disable-plugins")
+    options.add_argument("--disable-animations")
+    options.add_argument("--disable-cache")
+    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+
+    prefs = {
+        "profile.default_content_setting_values.images": 2,
+        "profile.managed_default_content_settings.stylesheets": 2,
+    }
+    options.add_experimental_option("prefs", prefs)
+
+    if len(chromeProfilePath) > 0:
+        initial_path = os.path.dirname(chromeProfilePath)
+        profile_dir = os.path.basename(chromeProfilePath)
+        options.add_argument('--user-data-dir=' + initial_path)
+        options.add_argument("--profile-directory=" + profile_dir)
+        logger.debug(f"Using Chrome profile directory: {chromeProfilePath}")
+    else:
+        options.add_argument("--incognito")
+        logger.debug("Using Chrome in incognito mode")
+
+    return options
+
+
+def printred(text):
+    red = "\033[91m"
+    reset = "\033[0m"
+    logger.debug("Printing text in red: %s", text)
+    print(f"{red}{text}{reset}")
+
+
+def printyellow(text):
+    yellow = "\033[93m"
+    reset = "\033[0m"
+    logger.debug("Printing text in yellow: %s", text)
+    print(f"{yellow}{text}{reset}")
+
+
+#src/llm/llm_manager.py
+
+import json
+import os
+import re
+import textwrap
+import time
+from abc import ABC, abstractmethod
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List
+from typing import Union
+
+import httpx
+from Levenshtein import distance
+from dotenv import load_dotenv
+from langchain_core.messages import BaseMessage
+from langchain_core.messages.ai import AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompt_values import StringPromptValue
+from langchain_core.prompts import ChatPromptTemplate
+
+import src.strings as strings
+from loguru import logger
+
+load_dotenv()
+
+
+class AIModel(ABC):
+    @abstractmethod
+    def invoke(self, prompt: str) -> str:
+        pass
+
+
+class OpenAIModel(AIModel):
+    def __init__(self, api_key: str, llm_model: str):
+        from langchain_openai import ChatOpenAI
+        self.model = ChatOpenAI(model_name=llm_model, openai_api_key=api_key,
+                                temperature=0.4)
+
+    def invoke(self, prompt: str) -> BaseMessage:
+        logger.debug("Invoking OpenAI API")
+        response = self.model.invoke(prompt)
+        return response
+
+
+class ClaudeModel(AIModel):
+    def __init__(self, api_key: str, llm_model: str):
+        from langchain_anthropic import ChatAnthropic
+        self.model = ChatAnthropic(model=llm_model, api_key=api_key,
+                                   temperature=0.4)
+
+    def invoke(self, prompt: str) -> BaseMessage:
+        response = self.model.invoke(prompt)
+        logger.debug("Invoking Claude API")
+        return response
+
+
+class OllamaModel(AIModel):
+    def __init__(self, llm_model: str, llm_api_url: str):
+        from langchain_ollama import ChatOllama
+
+        if len(llm_api_url) > 0:
+            logger.debug(f"Using Ollama with API URL: {llm_api_url}")
+            self.model = ChatOllama(model=llm_model, base_url=llm_api_url)
+        else:
+            self.model = ChatOllama(model=llm_model)
+
+    def invoke(self, prompt: str) -> BaseMessage:
+        response = self.model.invoke(prompt)
+        return response
+
+#gemini doesn't seem to work because API doesn't rstitute answers for questions that involve answers that are too short
+class GeminiModel(AIModel):
+    def __init__(self, api_key:str, llm_model: str):
+        from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
+        self.model = ChatGoogleGenerativeAI(model=llm_model, google_api_key=api_key,safety_settings={
+        HarmCategory.HARM_CATEGORY_UNSPECIFIED: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DEROGATORY: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_TOXICITY: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_VIOLENCE: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUAL: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_MEDICAL: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE
+        })
+
+    def invoke(self, prompt: str) -> BaseMessage:
+        response = self.model.invoke(prompt)
+        return response
+
+class HuggingFaceModel(AIModel):
+    def __init__(self, api_key: str, llm_model: str):
+        from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
+        self.model = HuggingFaceEndpoint(repo_id=llm_model, huggingfacehub_api_token=api_key,
+                                   temperature=0.4)
+        self.chatmodel=ChatHuggingFace(llm=self.model)
+
+    def invoke(self, prompt: str) -> BaseMessage:
+        response = self.chatmodel.invoke(prompt)
+        logger.debug("Invoking Model from Hugging Face API")
+        print(response,type(response))
+        return response
+
+class AIAdapter:
+    def __init__(self, config: dict, api_key: str):
+        self.model = self._create_model(config, api_key)
+
+    def _create_model(self, config: dict, api_key: str) -> AIModel:
+        llm_model_type = config['llm_model_type']
+        llm_model = config['llm_model']
+
+        llm_api_url = config.get('llm_api_url', "")
+
+        logger.debug(f"Using {llm_model_type} with {llm_model}")
+
+        if llm_model_type == "openai":
+            return OpenAIModel(api_key, llm_model)
+        elif llm_model_type == "claude":
+            return ClaudeModel(api_key, llm_model)
+        elif llm_model_type == "ollama":
+            return OllamaModel(llm_model, llm_api_url)
+        elif llm_model_type == "gemini":
+            return GeminiModel(api_key, llm_model)
+        elif llm_model_type == "huggingface":
+            return HuggingFaceModel(api_key, llm_model)        
+        else:
+            raise ValueError(f"Unsupported model type: {llm_model_type}")
+
+    def invoke(self, prompt: str) -> str:
+        return self.model.invoke(prompt)
+
+
+class LLMLogger:
+
+    def __init__(self, llm: Union[OpenAIModel, OllamaModel, ClaudeModel, GeminiModel]):
+        self.llm = llm
+        logger.debug(f"LLMLogger successfully initialized with LLM: {llm}")
+
+    @staticmethod
+    def log_request(prompts, parsed_reply: Dict[str, Dict]):
+        logger.debug("Starting log_request method")
+        logger.debug(f"Prompts received: {prompts}")
+        logger.debug(f"Parsed reply received: {parsed_reply}")
+
+        try:
+            calls_log = os.path.join(
+                Path("data_folder/output"), "open_ai_calls.json")
+            logger.debug(f"Logging path determined: {calls_log}")
+        except Exception as e:
+            logger.error(f"Error determining the log path: {str(e)}")
+            raise
+
+        if isinstance(prompts, StringPromptValue):
+            logger.debug("Prompts are of type StringPromptValue")
+            prompts = prompts.text
+            logger.debug(f"Prompts converted to text: {prompts}")
+        elif isinstance(prompts, Dict):
+            logger.debug("Prompts are of type Dict")
+            try:
+                prompts = {
+                    f"prompt_{i + 1}": prompt.content
+                    for i, prompt in enumerate(prompts.messages)
+                }
+                logger.debug(f"Prompts converted to dictionary: {prompts}")
+            except Exception as e:
+                logger.error(f"Error converting prompts to dictionary: {str(e)}")
+                raise
+        else:
+            logger.debug("Prompts are of unknown type, attempting default conversion")
+            try:
+                prompts = {
+                    f"prompt_{i + 1}": prompt.content
+                    for i, prompt in enumerate(prompts.messages)
+                }
+                logger.debug(f"Prompts converted to dictionary using default method: {prompts}")
+            except Exception as e:
+                logger.error(f"Error converting prompts using default method: {str(e)}")
+                raise
+
+        try:
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logger.debug(f"Current time obtained: {current_time}")
+        except Exception as e:
+            logger.error(f"Error obtaining current time: {str(e)}")
+            raise
+
+        try:
+            token_usage = parsed_reply["usage_metadata"]
+            output_tokens = token_usage["output_tokens"]
+            input_tokens = token_usage["input_tokens"]
+            total_tokens = token_usage["total_tokens"]
+            logger.debug(f"Token usage - Input: {input_tokens}, Output: {output_tokens}, Total: {total_tokens}")
+        except KeyError as e:
+            logger.error(f"KeyError in parsed_reply structure: {str(e)}")
+            raise
+
+        try:
+            model_name = parsed_reply["response_metadata"]["model_name"]
+            logger.debug(f"Model name: {model_name}")
+        except KeyError as e:
+            logger.error(f"KeyError in response_metadata: {str(e)}")
+            raise
+
+        try:
+            prompt_price_per_token = 0.00000015
+            completion_price_per_token = 0.0000006
+            total_cost = (input_tokens * prompt_price_per_token) + \
+                (output_tokens * completion_price_per_token)
+            logger.debug(f"Total cost calculated: {total_cost}")
+        except Exception as e:
+            logger.error(f"Error calculating total cost: {str(e)}")
+            raise
+
+        try:
+            log_entry = {
+                "model": model_name,
+                "time": current_time,
+                "prompts": prompts,
+                "replies": parsed_reply["content"],
+                "total_tokens": total_tokens,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_cost": total_cost,
+            }
+            logger.debug(f"Log entry created: {log_entry}")
+        except KeyError as e:
+            logger.error(f"Error creating log entry: missing key {str(e)} in parsed_reply")
+            raise
+
+        try:
+            with open(calls_log, "a", encoding="utf-8") as f:
+                json_string = json.dumps(
+                    log_entry, ensure_ascii=False, indent=4)
+                f.write(json_string + "\n")
+                logger.debug(f"Log entry written to file: {calls_log}")
+        except Exception as e:
+            logger.error(f"Error writing log entry to file: {str(e)}")
+            raise
+
+
+class LoggerChatModel:
+
+    def __init__(self, llm: Union[OpenAIModel, OllamaModel, ClaudeModel, GeminiModel]):
+        self.llm = llm
+        logger.debug(f"LoggerChatModel successfully initialized with LLM: {llm}")
+
+    def __call__(self, messages: List[Dict[str, str]]) -> str:
+        logger.debug(f"Entering __call__ method with messages: {messages}")
+        while True:
+            try:
+                logger.debug("Attempting to call the LLM with messages")
+
+                reply = self.llm.invoke(messages)
+                logger.debug(f"LLM response received: {reply}")
+
+                parsed_reply = self.parse_llmresult(reply)
+                logger.debug(f"Parsed LLM reply: {parsed_reply}")
+
+                LLMLogger.log_request(
+                    prompts=messages, parsed_reply=parsed_reply)
+                logger.debug("Request successfully logged")
+
+                return reply
+
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTPStatusError encountered: {str(e)}")
+                if e.response.status_code == 429:
+                    retry_after = e.response.headers.get('retry-after')
+                    retry_after_ms = e.response.headers.get('retry-after-ms')
+
+                    if retry_after:
+                        wait_time = int(retry_after)
+                        logger.warning(
+                            f"Rate limit exceeded. Waiting for {wait_time} seconds before retrying (extracted from 'retry-after' header)...")
+                        time.sleep(wait_time)
+                    elif retry_after_ms:
+                        wait_time = int(retry_after_ms) / 1000.0
+                        logger.warning(
+                            f"Rate limit exceeded. Waiting for {wait_time} seconds before retrying (extracted from 'retry-after-ms' header)...")
+                        time.sleep(wait_time)
+                    else:
+                        wait_time = 30
+                        logger.warning(
+                            f"'retry-after' header not found. Waiting for {wait_time} seconds before retrying (default)...")
+                        time.sleep(wait_time)
+                else:
+                    logger.error(f"HTTP error occurred with status code: {e.response.status_code}, waiting 30 seconds before retrying")
+                    time.sleep(30)
+
+            except Exception as e:
+                logger.error(f"Unexpected error occurred: {str(e)}")
+                logger.info(
+                    "Waiting for 30 seconds before retrying due to an unexpected error.")
+                time.sleep(30)
+                continue
+
+    def parse_llmresult(self, llmresult: AIMessage) -> Dict[str, Dict]:
+        logger.debug(f"Parsing LLM result: {llmresult}")
+
+        try:
+            if hasattr(llmresult, 'usage_metadata'):
+                content = llmresult.content
+                response_metadata = llmresult.response_metadata
+                id_ = llmresult.id
+                usage_metadata = llmresult.usage_metadata
+
+                parsed_result = {
+                    "content": content,
+                    "response_metadata": {
+                        "model_name": response_metadata.get("model_name", ""),
+                        "system_fingerprint": response_metadata.get("system_fingerprint", ""),
+                        "finish_reason": response_metadata.get("finish_reason", ""),
+                        "logprobs": response_metadata.get("logprobs", None),
+                    },
+                    "id": id_,
+                    "usage_metadata": {
+                        "input_tokens": usage_metadata.get("input_tokens", 0),
+                        "output_tokens": usage_metadata.get("output_tokens", 0),
+                        "total_tokens": usage_metadata.get("total_tokens", 0),
+                    },
+                }
+            else :  
+                content = llmresult.content
+                response_metadata = llmresult.response_metadata
+                id_ = llmresult.id
+                token_usage = response_metadata['token_usage']
+
+                parsed_result = {
+                    "content": content,
+                    "response_metadata": {
+                        "model_name": response_metadata.get("model", ""),
+                        "finish_reason": response_metadata.get("finish_reason", ""),
+                    },
+                    "id": id_,
+                    "usage_metadata": {
+                        "input_tokens": token_usage.prompt_tokens,
+                        "output_tokens": token_usage.completion_tokens,
+                        "total_tokens": token_usage.total_tokens,
+                    },
+                }                  
+            logger.debug(f"Parsed LLM result successfully: {parsed_result}")
+            return parsed_result
+
+        except KeyError as e:
+            logger.error(
+                f"KeyError while parsing LLM result: missing key {str(e)}")
+            raise
+
+        except Exception as e:
+            logger.error(
+                f"Unexpected error while parsing LLM result: {str(e)}")
+            raise
+
+
+class GPTAnswerer:
+
+    def __init__(self, config, llm_api_key):
+        self.ai_adapter = AIAdapter(config, llm_api_key)
+        self.llm_cheap = LoggerChatModel(self.ai_adapter)
+
+    @property
+    def job_description(self):
+        return self.job.description
+
+    @staticmethod
+    def find_best_match(text: str, options: list[str]) -> str:
+        logger.debug(f"Finding best match for text: '{text}' in options: {options}")
+        distances = [
+            (option, distance(text.lower(), option.lower())) for option in options
+        ]
+        best_option = min(distances, key=lambda x: x[1])[0]
+        logger.debug(f"Best match found: {best_option}")
+        return best_option
+
+    @staticmethod
+    def _remove_placeholders(text: str) -> str:
+        logger.debug(f"Removing placeholders from text: {text}")
+        text = text.replace("PLACEHOLDER", "")
+        return text.strip()
+
+    @staticmethod
+    def _preprocess_template_string(template: str) -> str:
+        logger.debug("Preprocessing template string")
+        return textwrap.dedent(template)
+
+    def set_resume(self, resume):
+        logger.debug(f"Setting resume: {resume}")
+        self.resume = resume
+
+    def set_job(self, job):
+        logger.debug(f"Setting job: {job}")
+        self.job = job
+        self.job.set_summarize_job_description(
+            self.summarize_job_description(self.job.description))
+
+    def set_job_application_profile(self, job_application_profile):
+        logger.debug(f"Setting job application profile: {job_application_profile}")
+        self.job_application_profile = job_application_profile
+
+    def summarize_job_description(self, text: str) -> str:
+        logger.debug(f"Summarizing job description: {text}")
+        strings.summarize_prompt_template = self._preprocess_template_string(
+            strings.summarize_prompt_template
+        )
+        prompt = ChatPromptTemplate.from_template(
+            strings.summarize_prompt_template)
+        chain = prompt | self.llm_cheap | StrOutputParser()
+        output = chain.invoke({"text": text})
+        logger.debug(f"Summary generated: {output}")
+        return output
+
+    def _create_chain(self, template: str):
+        logger.debug(f"Creating chain with template: {template}")
+        prompt = ChatPromptTemplate.from_template(template)
+        return prompt | self.llm_cheap | StrOutputParser()
+
+    def answer_question_textual_wide_range(self, question: str) -> str:
+        logger.debug(f"Answering textual question: {question}")
+        chains = {
+            "personal_information": self._create_chain(strings.personal_information_template),
+            "self_identification": self._create_chain(strings.self_identification_template),
+            "legal_authorization": self._create_chain(strings.legal_authorization_template),
+            "work_preferences": self._create_chain(strings.work_preferences_template),
+            "education_details": self._create_chain(strings.education_details_template),
+            "experience_details": self._create_chain(strings.experience_details_template),
+            "projects": self._create_chain(strings.projects_template),
+            "availability": self._create_chain(strings.availability_template),
+            "salary_expectations": self._create_chain(strings.salary_expectations_template),
+            "certifications": self._create_chain(strings.certifications_template),
+            "languages": self._create_chain(strings.languages_template),
+            "interests": self._create_chain(strings.interests_template),
+            "cover_letter": self._create_chain(strings.coverletter_template),
+        }
+        section_prompt = """You are assisting a bot designed to automatically apply for jobs on AIHawk. The bot receives various questions about job applications and needs to determine the most relevant section of the resume to provide an accurate response.
+
+        For the following question: '{question}', determine which section of the resume is most relevant. 
+        Respond with exactly one of the following options:
+        - Personal information
+        - Self Identification
+        - Legal Authorization
+        - Work Preferences
+        - Education Details
+        - Experience Details
+        - Projects
+        - Availability
+        - Salary Expectations
+        - Certifications
+        - Languages
+        - Interests
+        - Cover letter
+
+        Here are detailed guidelines to help you choose the correct section:
+
+        1. **Personal Information**:
+        - **Purpose**: Contains your basic contact details and online profiles.
+        - **Use When**: The question is about how to contact you or requests links to your professional online presence.
+        - **Examples**: Email address, phone number, AIHawk profile, GitHub repository, personal website.
+
+        2. **Self Identification**:
+        - **Purpose**: Covers personal identifiers and demographic information.
+        - **Use When**: The question pertains to your gender, pronouns, veteran status, disability status, or ethnicity.
+        - **Examples**: Gender, pronouns, veteran status, disability status, ethnicity.
+
+        3. **Legal Authorization**:
+        - **Purpose**: Details your work authorization status and visa requirements.
+        - **Use When**: The question asks about your ability to work in specific countries or if you need sponsorship or visas.
+        - **Examples**: Work authorization in EU and US, visa requirements, legally allowed to work.
+
+        4. **Work Preferences**:
+        - **Purpose**: Specifies your preferences regarding work conditions and job roles.
+        - **Use When**: The question is about your preferences for remote work, in-person work, relocation, and willingness to undergo assessments or background checks.
+        - **Examples**: Remote work, in-person work, open to relocation, willingness to complete assessments.
+
+        5. **Education Details**:
+        - **Purpose**: Contains information about your academic qualifications.
+        - **Use When**: The question concerns your degrees, universities attended, GPA, and relevant coursework.
+        - **Examples**: Degree, university, GPA, field of study, exams.
+
+        6. **Experience Details**:
+        - **Purpose**: Details your professional work history and key responsibilities.
+        - **Use When**: The question pertains to your job roles, responsibilities, and achievements in previous positions.
+        - **Examples**: Job positions, company names, key responsibilities, skills acquired.
+
+        7. **Projects**:
+        - **Purpose**: Highlights specific projects you have worked on.
+        - **Use When**: The question asks about particular projects, their descriptions, or links to project repositories.
+        - **Examples**: Project names, descriptions, links to project repositories.
+
+        8. **Availability**:
+        - **Purpose**: Provides information on your availability for new roles.
+        - **Use When**: The question is about how soon you can start a new job or your notice period.
+        - **Examples**: Notice period, availability to start.
+
+        9. **Salary Expectations**:
+        - **Purpose**: Covers your expected salary range.
+        - **Use When**: The question pertains to your salary expectations or compensation requirements.
+        - **Examples**: Desired salary range.
+
+        10. **Certifications**:
+            - **Purpose**: Lists your professional certifications or licenses.
+            - **Use When**: The question involves your certifications or qualifications from recognized organizations.
+            - **Examples**: Certification names, issuing bodies, dates of validity.
+
+        11. **Languages**:
+            - **Purpose**: Describes the languages you can speak and your proficiency levels.
+            - **Use When**: The question asks about your language skills or proficiency in specific languages.
+            - **Examples**: Languages spoken, proficiency levels.
+
+        12. **Interests**:
+            - **Purpose**: Details your personal or professional interests.
+            - **Use When**: The question is about your hobbies, interests, or activities outside of work.
+            - **Examples**: Personal hobbies, professional interests.
+
+        13. **Cover Letter**:
+            - **Purpose**: Contains your personalized cover letter or statement.
+            - **Use When**: The question involves your cover letter or specific written content intended for the job application.
+            - **Examples**: Cover letter content, personalized statements.
+
+        Provide only the exact name of the section from the list above with no additional text.
+        """
+        prompt = ChatPromptTemplate.from_template(section_prompt)
+        chain = prompt | self.llm_cheap | StrOutputParser()
+        output = chain.invoke({"question": question})
+
+        match = re.search(
+            r"(Personal information|Self Identification|Legal Authorization|Work Preferences|Education "
+            r"Details|Experience Details|Projects|Availability|Salary "
+            r"Expectations|Certifications|Languages|Interests|Cover letter)",
+            output, re.IGNORECASE)
+        if not match:
+            raise ValueError(
+                "Could not extract section name from the response.")
+
+        section_name = match.group(1).lower().replace(" ", "_")
+
+        if section_name == "cover_letter":
+            chain = chains.get(section_name)
+            output = chain.invoke(
+                {"resume": self.resume, "job_description": self.job_description})
+            logger.debug(f"Cover letter generated: {output}")
+            return output
+        resume_section = getattr(self.resume, section_name, None) or getattr(self.job_application_profile, section_name,
+                                                                             None)
+        if resume_section is None:
+            logger.error(
+                f"Section '{section_name}' not found in either resume or job_application_profile.")
+            raise ValueError(f"Section '{section_name}' not found in either resume or job_application_profile.")
+        chain = chains.get(section_name)
+        if chain is None:
+            logger.error(f"Chain not defined for section '{section_name}'")
+            raise ValueError(f"Chain not defined for section '{section_name}'")
+        output = chain.invoke(
+            {"resume_section": resume_section, "question": question})
+        logger.debug(f"Question answered: {output}")
+        return output
+
+    def answer_question_numeric(self, question: str, default_experience: int = 3) -> int:
+        logger.debug(f"Answering numeric question: {question}")
+        func_template = self._preprocess_template_string(
+            strings.numeric_question_template)
+        prompt = ChatPromptTemplate.from_template(func_template)
+        chain = prompt | self.llm_cheap | StrOutputParser()
+        output_str = chain.invoke(
+            {"resume_educations": self.resume.education_details, "resume_jobs": self.resume.experience_details,
+             "resume_projects": self.resume.projects, "question": question})
+        logger.debug(f"Raw output for numeric question: {output_str}")
+        try:
+            output = self.extract_number_from_string(output_str)
+            logger.debug(f"Extracted number: {output}")
+        except ValueError:
+            logger.warning(
+                f"Failed to extract number, using default experience: {default_experience}")
+            output = default_experience
+        return output
+
+    def extract_number_from_string(self, output_str):
+        logger.debug(f"Extracting number from string: {output_str}")
+        numbers = re.findall(r"\d+", output_str)
+        if numbers:
+            logger.debug(f"Numbers found: {numbers}")
+            return int(numbers[0])
+        else:
+            logger.error("No numbers found in the string")
+            raise ValueError("No numbers found in the string")
+
+    def answer_question_from_options(self, question: str, options: list[str]) -> str:
+        logger.debug(f"Answering question from options: {question}")
+        func_template = self._preprocess_template_string(
+            strings.options_template)
+        prompt = ChatPromptTemplate.from_template(func_template)
+        chain = prompt | self.llm_cheap | StrOutputParser()
+        output_str = chain.invoke(
+            {"resume": self.resume, "question": question, "options": options})
+        logger.debug(f"Raw output for options question: {output_str}")
+        best_option = self.find_best_match(output_str, options)
+        logger.debug(f"Best option determined: {best_option}")
+        return best_option
+
+    def resume_or_cover(self, phrase: str) -> str:
+        logger.debug(
+            f"Determining if phrase refers to resume or cover letter: {phrase}")
+        prompt_template = """
+                Given the following phrase, respond with only 'resume' if the phrase is about a resume, or 'cover' if it's about a cover letter.
+                If the phrase contains only one word 'upload', consider it as 'cover'.
+                If the phrase contains 'upload resume', consider it as 'resume'.
+                Do not provide any additional information or explanations.
+
+                phrase: {phrase}
+                """
+        prompt = ChatPromptTemplate.from_template(prompt_template)
+        chain = prompt | self.llm_cheap | StrOutputParser()
+        response = chain.invoke({"phrase": phrase})
+        logger.debug(f"Response for resume_or_cover: {response}")
+        if "resume" in response:
+            return "resume"
+        elif "cover" in response:
+            return "cover"
+        else:
+            return "resume"
+
+#tests/test_aihawk_authenticator.py
+
+import pytest
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from src.aihawk_authenticator import AIHawkAuthenticator
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
+
+
+@pytest.fixture
+def mock_driver(mocker):
+    """Fixture to mock the Selenium WebDriver."""
+    return mocker.Mock()
+
+
+@pytest.fixture
+def authenticator(mock_driver):
+    """Fixture to initialize AIHawkAuthenticator with a mocked driver."""
+    return AIHawkAuthenticator(mock_driver)
+
+
+def test_handle_login(mocker, authenticator):
+    """Test handling the AIHawk login process."""
+    mocker.patch.object(authenticator.driver, 'get')
+    mocker.patch.object(authenticator, 'enter_credentials')
+    mocker.patch.object(authenticator, 'handle_security_check')
+
+    # Mock current_url as a regular return value, not PropertyMock
+    mocker.patch.object(authenticator.driver, 'current_url',
+                        return_value='https://www.linkedin.com/login')
+
+    authenticator.handle_login()
+
+    authenticator.driver.get.assert_called_with(
+        'https://www.linkedin.com/login')
+    authenticator.enter_credentials.assert_called_once()
+    authenticator.handle_security_check.assert_called_once()
+
+
+def test_enter_credentials_success(mocker, authenticator):
+    """Test entering credentials."""
+    email_mock = mocker.Mock()
+    password_mock = mocker.Mock()
+
+    mocker.patch.object(WebDriverWait, 'until', return_value=email_mock)
+    mocker.patch.object(authenticator.driver, 'find_element',
+                        return_value=password_mock)
+
+
+
+
+
+
+def test_is_logged_in_true(mocker, authenticator):
+    """Test if the user is logged in."""
+    buttons_mock = mocker.Mock()
+    buttons_mock.text = "Start a post"
+    mocker.patch.object(WebDriverWait, 'until')
+    mocker.patch.object(authenticator.driver, 'find_elements',
+                        return_value=[buttons_mock])
+
+    assert authenticator.is_logged_in() is True
+
+
+def test_is_logged_in_false(mocker, authenticator):
+    """Test if the user is not logged in."""
+    mocker.patch.object(WebDriverWait, 'until')
+    mocker.patch.object(authenticator.driver, 'find_elements', return_value=[])
+
+    assert authenticator.is_logged_in() is False
+
+
+def test_handle_security_check_success(mocker, authenticator):
+    """Test handling security check successfully."""
+    mocker.patch.object(WebDriverWait, 'until', side_effect=[
+        mocker.Mock(),  # Security checkpoint detection
+        mocker.Mock()   # Security check completion
+    ])
+
+    authenticator.handle_security_check()
+
+    # Verify WebDriverWait is called with EC.url_contains for both the challenge and feed
+    WebDriverWait(authenticator.driver, 10).until.assert_any_call(mocker.ANY)
+    WebDriverWait(authenticator.driver, 300).until.assert_any_call(mocker.ANY)
+
+
+def test_handle_security_check_timeout(mocker, authenticator):
+    """Test handling security check timeout."""
+    mocker.patch.object(WebDriverWait, 'until', side_effect=TimeoutException)
+
+    authenticator.handle_security_check()
+
+    # Verify WebDriverWait is called with EC.url_contains for the challenge
+    WebDriverWait(authenticator.driver, 10).until.assert_any_call(mocker.ANY)
+
+
+#tests/test_aihawk_bot_facade.py
+
+import pytest
+# from src.aihawk_job_manager import JobManager
+
+@pytest.fixture
+def job_manager():
+    """Fixture for JobManager."""
+    return None  # Replace with valid instance or mock later
+
+def test_bot_functionality(job_manager):
+    """Test AIHawk bot facade."""
+    # Example: test job manager interacts with the bot facade correctly
+    job = {"title": "Software Engineer"}
+    # job_manager.some_method_to_apply(job)
+    assert job is not None  # Placeholder for actual test
+
+
+#tests/test_aihawk_easy_applier.py
+
+import pytest
+from unittest import mock
+from src.aihawk_easy_applier import AIHawkEasyApplier
+
+
+@pytest.fixture
+def mock_driver():
+    """Fixture to mock Selenium WebDriver."""
+    return mock.Mock()
+
+
+@pytest.fixture
+def mock_gpt_answerer():
+    """Fixture to mock GPT Answerer."""
+    return mock.Mock()
+
+
+@pytest.fixture
+def mock_resume_generator_manager():
+    """Fixture to mock Resume Generator Manager."""
+    return mock.Mock()
+
+
+@pytest.fixture
+def easy_applier(mock_driver, mock_gpt_answerer, mock_resume_generator_manager):
+    """Fixture to initialize AIHawkEasyApplier with mocks."""
+    return AIHawkEasyApplier(
+        driver=mock_driver,
+        resume_dir="/path/to/resume",
+        set_old_answers=[('Question 1', 'Answer 1', 'Type 1')],
+        gpt_answerer=mock_gpt_answerer,
+        resume_generator_manager=mock_resume_generator_manager
+    )
+
+
+def test_initialization(mocker, easy_applier):
+    """Test that AIHawkEasyApplier is initialized correctly."""
+    # Mock os.path.exists to return True
+    mocker.patch('os.path.exists', return_value=True)
+
+    easy_applier = AIHawkEasyApplier(
+        driver=mocker.Mock(),
+        resume_dir="/path/to/resume",
+        set_old_answers=[('Question 1', 'Answer 1', 'Type 1')],
+        gpt_answerer=mocker.Mock(),
+        resume_generator_manager=mocker.Mock()
+    )
+
+    assert easy_applier.resume_path == "/path/to/resume"
+    assert len(easy_applier.set_old_answers) == 1
+    assert easy_applier.gpt_answerer is not None
+    assert easy_applier.resume_generator_manager is not None
+
+
+def test_apply_to_job_success(mocker, easy_applier):
+    """Test successfully applying to a job."""
+    mock_job = mock.Mock()
+
+    # Mock job_apply so we don't actually try to apply
+    mocker.patch.object(easy_applier, 'job_apply')
+
+    easy_applier.apply_to_job(mock_job)
+    easy_applier.job_apply.assert_called_once_with(mock_job)
+
+
+def test_apply_to_job_failure(mocker, easy_applier):
+    """Test failure while applying to a job."""
+    mock_job = mock.Mock()
+    mocker.patch.object(easy_applier, 'job_apply',
+                        side_effect=Exception("Test error"))
+
+    with pytest.raises(Exception, match="Test error"):
+        easy_applier.apply_to_job(mock_job)
+
+    easy_applier.job_apply.assert_called_once_with(mock_job)
+
+
+def test_check_for_premium_redirect_no_redirect(mocker, easy_applier):
+    """Test that check_for_premium_redirect works when there's no redirect."""
+    mock_job = mock.Mock()
+    easy_applier.driver.current_url = "https://www.linkedin.com/jobs/view/1234"
+
+    easy_applier.check_for_premium_redirect(mock_job)
+    easy_applier.driver.get.assert_not_called()
+
+
+def test_check_for_premium_redirect_with_redirect(mocker, easy_applier):
+    """Test that check_for_premium_redirect handles AIHawk Premium redirects."""
+    mock_job = mock.Mock()
+    easy_applier.driver.current_url = "https://www.linkedin.com/premium"
+    mock_job.link = "https://www.linkedin.com/jobs/view/1234"
+
+    with pytest.raises(Exception, match="Redirected to AIHawk Premium page and failed to return"):
+        easy_applier.check_for_premium_redirect(mock_job)
+
+    # Verify that it attempted to return to the job page 3 times
+    assert easy_applier.driver.get.call_count == 3
+
+
+#tests/test_aihawk_job_manager.py
+
+from src.job import Job
+from unittest import mock
+from pathlib import Path
+import os
+import pytest
+from src.aihawk_job_manager import AIHawkJobManager
+from selenium.common.exceptions import NoSuchElementException
+from loguru import logger
+
+
+@pytest.fixture
+def job_manager(mocker):
+    """Fixture to create a AIHawkJobManager instance with mocked driver."""
+    mock_driver = mocker.Mock()
+    return AIHawkJobManager(mock_driver)
+
+
+def test_initialization(job_manager):
+    """Test AIHawkJobManager initialization."""
+    assert job_manager.driver is not None
+    assert job_manager.set_old_answers == set()
+    assert job_manager.easy_applier_component is None
+
+
+def test_set_parameters(mocker, job_manager):
+    """Test setting parameters for the AIHawkJobManager."""
+    # Mocking os.path.exists to return True for the resume path
+    mocker.patch('pathlib.Path.exists', return_value=True)
+
+    params = {
+        'company_blacklist': ['Company A', 'Company B'],
+        'title_blacklist': ['Intern', 'Junior'],
+        'positions': ['Software Engineer', 'Data Scientist'],
+        'locations': ['New York', 'San Francisco'],
+        'apply_once_at_company': True,
+        'uploads': {'resume': '/path/to/resume'},  # Resume path provided here
+        'outputFileDirectory': '/path/to/output',
+        'job_applicants_threshold': {
+            'min_applicants': 5,
+            'max_applicants': 50
+        },
+        'remote': False,
+        'distance': 50,
+        'date': {'all time': True}
+    }
+
+    job_manager.set_parameters(params)
+
+    # Normalize paths to handle platform differences (e.g., Windows vs Unix-like systems)
+    assert str(job_manager.resume_path) == os.path.normpath('/path/to/resume')
+    assert str(job_manager.output_file_directory) == os.path.normpath(
+        '/path/to/output')
+
+
+def next_job_page(self, position, location, job_page):
+    logger.debug(f"Navigating to next job page: {position} in {location}, page {job_page}")
+    self.driver.get(
+        f"https://www.linkedin.com/jobs/search/{self.base_search_url}&keywords={position}&location={location}&start={job_page * 25}")
+
+
+def test_get_jobs_from_page_no_jobs(mocker, job_manager):
+    """Test get_jobs_from_page when no jobs are found."""
+    mocker.patch.object(job_manager.driver, 'find_element',
+                        side_effect=NoSuchElementException)
+
+    jobs = job_manager.get_jobs_from_page()
+    assert jobs == []
+
+
+def test_get_jobs_from_page_with_jobs(mocker, job_manager):
+    """Test get_jobs_from_page when job elements are found."""
+    # Mock the no_jobs_element to behave correctly
+    mock_no_jobs_element = mocker.Mock()
+    mock_no_jobs_element.text = "No matching jobs found"
+
+    # Mocking the find_element to return the mock no_jobs_element
+    mocker.patch.object(job_manager.driver, 'find_element',
+                        return_value=mock_no_jobs_element)
+
+    # Mock the page_source
+    mocker.patch.object(job_manager.driver, 'page_source',
+                        return_value="some page content")
+
+    # Ensure jobs are returned as empty list due to "No matching jobs found"
+    jobs = job_manager.get_jobs_from_page()
+    assert jobs == []  # No jobs expected due to "No matching jobs found"
+
+
+def test_apply_jobs_with_no_jobs(mocker, job_manager):
+    """Test apply_jobs when no jobs are found."""
+    # Mocking find_element to return a mock element that simulates no jobs
+    mock_element = mocker.Mock()
+    mock_element.text = "No matching jobs found"
+
+    # Mock the driver to simulate the page source
+    mocker.patch.object(job_manager.driver, 'page_source', return_value="")
+
+    # Mock the driver to return the mock element when find_element is called
+    mocker.patch.object(job_manager.driver, 'find_element',
+                        return_value=mock_element)
+
+    # Call apply_jobs and ensure no exceptions are raised
+    job_manager.apply_jobs()
+
+    # Ensure it attempted to find the job results list
+    assert job_manager.driver.find_element.call_count == 1
+
+
+def test_apply_jobs_with_jobs(mocker, job_manager):
+    """Test apply_jobs when jobs are present."""
+
+    # Mock no_jobs_element to simulate the absence of "No matching jobs found" banner
+    no_jobs_element = mocker.Mock()
+    no_jobs_element.text = ""  # Empty text means "No matching jobs found" is not present
+    mocker.patch.object(job_manager.driver, 'find_element',
+                        return_value=no_jobs_element)
+
+    # Mock the page_source to simulate what the page looks like when jobs are present
+    mocker.patch.object(job_manager.driver, 'page_source',
+                        return_value="some job content")
+
+    # Mock the outer find_elements (scaffold-layout__list-container)
+    container_mock = mocker.Mock()
+
+    # Mock the inner find_elements to return job list items
+    job_element_mock = mocker.Mock()
+    # Simulating two job items
+    job_elements_list = [job_element_mock, job_element_mock]
+
+    # Return the container mock, which itself returns the job elements list
+    container_mock.find_elements.return_value = job_elements_list
+    mocker.patch.object(job_manager.driver, 'find_elements',
+                        return_value=[container_mock])
+
+    # Mock the extract_job_information_from_tile method to return sample job info
+    mocker.patch.object(job_manager, 'extract_job_information_from_tile', return_value=(
+        "Title", "Company", "Location", "Apply", "Link"))
+
+    # Mock other methods like is_blacklisted, is_already_applied_to_job, and is_already_applied_to_company
+    mocker.patch.object(job_manager, 'is_blacklisted', return_value=False)
+    mocker.patch.object(
+        job_manager, 'is_already_applied_to_job', return_value=False)
+    mocker.patch.object(
+        job_manager, 'is_already_applied_to_company', return_value=False)
+
+    # Mock the AIHawkEasyApplier component
+    job_manager.easy_applier_component = mocker.Mock()
+
+    # Mock the output_file_directory as a valid Path object
+    job_manager.output_file_directory = Path("/mocked/path/to/output")
+
+    # Mock Path.exists() to always return True (so no actual file system interaction is needed)
+    mocker.patch.object(Path, 'exists', return_value=True)
+
+    # Mock the open function to prevent actual file writing
+    mock_open = mocker.mock_open()
+    mocker.patch('builtins.open', mock_open)
+
+    # Run the apply_jobs method
+    job_manager.apply_jobs()
+
+    # Assertions
+    assert job_manager.driver.find_elements.call_count == 1
+    # Called for each job element
+    assert job_manager.extract_job_information_from_tile.call_count == 2
+    # Called for each job element
+    assert job_manager.easy_applier_component.job_apply.call_count == 2
+    mock_open.assert_called()  # Ensure that the open function was called
+
+
+#tests/test_job_application_profile.py
+
+import pytest
+from src.job_application_profile import JobApplicationProfile
+
+@pytest.fixture
+def valid_yaml():
+    """Valid YAML string for initializing JobApplicationProfile."""
+    return """
+    self_identification:
+      gender: Male
+      pronouns: He/Him
+      veteran: No
+      disability: No
+      ethnicity: Asian
+    legal_authorization:
+      eu_work_authorization: "Yes"
+      us_work_authorization: "Yes"
+      requires_us_visa: "No"
+      requires_us_sponsorship: "Yes"
+      requires_eu_visa: "No"
+      legally_allowed_to_work_in_eu: "Yes"
+      legally_allowed_to_work_in_us: "Yes"
+      requires_eu_sponsorship: "No"
+      canada_work_authorization: "Yes"
+      requires_canada_visa: "No"
+      legally_allowed_to_work_in_canada: "Yes"
+      requires_canada_sponsorship: "No"
+      uk_work_authorization: "Yes"
+      requires_uk_visa: "No"
+      legally_allowed_to_work_in_uk: "Yes"
+      requires_uk_sponsorship: "No"
+    work_preferences:
+      remote_work: "Yes"
+      in_person_work: "No"
+      open_to_relocation: "Yes"
+      willing_to_complete_assessments: "Yes"
+      willing_to_undergo_drug_tests: "Yes"
+      willing_to_undergo_background_checks: "Yes"
+    availability:
+      notice_period: "2 weeks"
+    salary_expectations:
+      salary_range_usd: "80000-120000"
+    """
+
+@pytest.fixture
+def missing_field_yaml():
+    """YAML string missing a required field (self_identification)."""
+    return """
+    legal_authorization:
+      eu_work_authorization: "Yes"
+      us_work_authorization: "Yes"
+      requires_us_visa: "No"
+      requires_us_sponsorship: "Yes"
+      requires_eu_visa: "No"
+      legally_allowed_to_work_in_eu: "Yes"
+      legally_allowed_to_work_in_us: "Yes"
+      requires_eu_sponsorship: "No"
+      canada_work_authorization: "Yes"
+      requires_canada_visa: "No"
+      legally_allowed_to_work_in_canada: "Yes"
+      requires_canada_sponsorship: "No"
+      uk_work_authorization: "Yes"
+      requires_uk_visa: "No"
+      legally_allowed_to_work_in_uk: "Yes"
+      requires_uk_sponsorship: "No"
+    work_preferences:
+      remote_work: "Yes"
+      in_person_work: "No"
+      open_to_relocation: "Yes"
+      willing_to_complete_assessments: "Yes"
+      willing_to_undergo_drug_tests: "Yes"
+      willing_to_undergo_background_checks: "Yes"
+    availability:
+      notice_period: "2 weeks"
+    salary_expectations:
+      salary_range_usd: "80000-120000"
+    """
+
+@pytest.fixture
+def invalid_type_yaml():
+    """YAML string with an invalid type for a field."""
+    return """
+    self_identification:
+      gender: Male
+      pronouns: He/Him
+      veteran: No
+      disability: No
+      ethnicity: Asian
+    legal_authorization:
+      eu_work_authorization: "Yes"
+      us_work_authorization: "Yes"
+      requires_us_visa: "No"
+      requires_us_sponsorship: "Yes"
+      requires_eu_visa: "No"
+      legally_allowed_to_work_in_eu: "Yes"
+      legally_allowed_to_work_in_us: "Yes"
+      requires_eu_sponsorship: "No"
+      canada_work_authorization: "Yes"
+      requires_canada_visa: "No"
+      legally_allowed_to_work_in_canada: "Yes"
+      requires_canada_sponsorship: "No"
+      uk_work_authorization: "Yes"
+      requires_uk_visa: "No"
+      legally_allowed_to_work_in_uk: "Yes"
+      requires_uk_sponsorship: "No"
+    work_preferences:
+      remote_work: 12345  # Invalid type, expecting a string
+      in_person_work: "No"
+      open_to_relocation: "Yes"
+      willing_to_complete_assessments: "Yes"
+      willing_to_undergo_drug_tests: "Yes"
+      willing_to_undergo_background_checks: "Yes"
+    availability:
+      notice_period: "2 weeks"
+    salary_expectations:
+      salary_range_usd: "80000-120000"
+    """
+
+def test_initialize_with_valid_yaml(valid_yaml):
+    """Test initializing JobApplicationProfile with valid YAML."""
+    profile = JobApplicationProfile(valid_yaml)
+
+    # Check that the profile fields are correctly initialized
+    assert profile.self_identification.gender == "Male"
+    assert profile.self_identification.pronouns == "He/Him"
+    assert profile.legal_authorization.eu_work_authorization == "Yes"
+    assert profile.work_preferences.remote_work == "Yes"
+    assert profile.availability.notice_period == "2 weeks"
+    assert profile.salary_expectations.salary_range_usd == "80000-120000"
+
+def test_initialize_with_missing_field(missing_field_yaml):
+    """Test initializing JobApplicationProfile with missing required fields."""
+    with pytest.raises(KeyError) as excinfo:
+        JobApplicationProfile(missing_field_yaml)
+    assert "self_identification" in str(excinfo.value)
+
+def test_initialize_with_invalid_yaml():
+    """Test initializing JobApplicationProfile with invalid YAML."""
+    invalid_yaml_str = """
+    self_identification:
+      gender: Male
+      pronouns: He/Him
+      veteran: No
+      disability: No
+      ethnicity: Asian
+    legal_authorization:
+      eu_work_authorization: "Yes"
+      us_work_authorization: "Yes"
+      requires_us_visa: "No"
+      requires_us_sponsorship: "Yes"
+      requires_eu_visa: "No"
+      legally_allowed_to_work_in_eu: "Yes"
+      legally_allowed_to_work_in_us: "Yes"
+      requires_eu_sponsorship: "No"
+      canada_work_authorization: "Yes"
+      requires_canada_visa: "No"
+      legally_allowed_to_work_in_canada: "Yes"
+      requires_canada_sponsorship: "No"
+      uk_work_authorization: "Yes"
+      requires_uk_visa: "No"
+      legally_allowed_to_work_in_uk: "Yes"
+      requires_uk_sponsorship: "No"
+    work_preferences:
+      remote_work: "Yes"
+      in_person_work: "No"
+    availability:
+      notice_period: "2 weeks"
+    salary_expectations:
+      salary_range_usd: "80000-120000"
+    """  # Missing fields in work_preferences
+
+    with pytest.raises(TypeError):
+        JobApplicationProfile(invalid_yaml_str)
+
+def test_str_representation(valid_yaml):
+    """Test the string representation of JobApplicationProfile."""
+    profile = JobApplicationProfile(valid_yaml)
+    profile_str = str(profile)
+
+    assert "Self Identification:" in profile_str
+    assert "Legal Authorization:" in profile_str
+    assert "Work Preferences:" in profile_str
+    assert "Availability:" in profile_str
+    assert "Salary Expectations:" in profile_str
+    assert "Male" in profile_str
+    assert "80000-120000" in profile_str
+
+
+#tests/test_utils.py
+
+# tests/test_utils.py
+import pytest
+import os
+import time
+from unittest import mock
+from selenium.webdriver.remote.webelement import WebElement
+from src.utils import ensure_chrome_profile, is_scrollable, scroll_slow, chrome_browser_options, printred, printyellow
+
+# Mocking logging to avoid actual file writing
+@pytest.fixture(autouse=True)
+def mock_logger(mocker):
+    mocker.patch("src.utils.logger")
+
+# Test ensure_chrome_profile function
+def test_ensure_chrome_profile(mocker):
+    mocker.patch("os.path.exists", return_value=False)  # Pretend directory doesn't exist
+    mocker.patch("os.makedirs")  # Mock making directories
+
+    # Call the function
+    profile_path = ensure_chrome_profile()
+
+    # Verify that os.makedirs was called twice to create the directory
+    assert profile_path.endswith("linkedin_profile")
+    assert os.path.exists.called
+    assert os.makedirs.called
+
+# Test is_scrollable function
+def test_is_scrollable(mocker):
+    mock_element = mocker.Mock(spec=WebElement)
+    mock_element.get_attribute.side_effect = lambda attr: "1000" if attr == "scrollHeight" else "500"
+
+    # Call the function
+    scrollable = is_scrollable(mock_element)
+
+    # Check the expected outcome
+    assert scrollable is True
+    mock_element.get_attribute.assert_any_call("scrollHeight")
+    mock_element.get_attribute.assert_any_call("clientHeight")
+
+# Test scroll_slow function
+def test_scroll_slow(mocker):
+    mock_driver = mocker.Mock()
+    mock_element = mocker.Mock(spec=WebElement)
+
+    # Mock element's attributes for scrolling
+    mock_element.get_attribute.side_effect = lambda attr: "2000" if attr == "scrollHeight" else "0"
+    mock_element.is_displayed.return_value = True
+    mocker.patch("time.sleep")  # Mock time.sleep to avoid waiting
+
+    # Call the function
+    scroll_slow(mock_driver, mock_element, start=0, end=1000, step=100, reverse=False)
+
+    # Ensure that scrolling happened multiple times
+    assert mock_driver.execute_script.called
+    mock_element.is_displayed.assert_called_once()
+
+def test_scroll_slow_element_not_scrollable(mocker):
+    mock_driver = mocker.Mock()
+    mock_element = mocker.Mock(spec=WebElement)
+
+    # Mock the attributes so the element is not scrollable
+    mock_element.get_attribute.side_effect = lambda attr: "1000" if attr == "scrollHeight" else "1000"
+    mock_element.is_displayed.return_value = True
+
+    scroll_slow(mock_driver, mock_element, start=0, end=1000, step=100)
+
+    # Ensure it detected non-scrollable element
+    mock_driver.execute_script.assert_not_called()
+
+# Test chrome_browser_options function
+def test_chrome_browser_options(mocker):
+    mocker.patch("src.utils.ensure_chrome_profile")
+    mocker.patch("os.path.dirname", return_value="/mocked/path")
+    mocker.patch("os.path.basename", return_value="profile_directory")
+
+    mock_options = mocker.Mock()
+
+    mocker.patch("selenium.webdriver.ChromeOptions", return_value=mock_options)
+
+    # Call the function
+    options = chrome_browser_options()
+
+    # Ensure options were set
+    assert mock_options.add_argument.called
+    assert options == mock_options
+
+# Test printred and printyellow functions
+def test_printred(mocker):
+    mocker.patch("builtins.print")
+    printred("Test")
+    print.assert_called_once_with("\033[91mTest\033[0m")
+
+def test_printyellow(mocker):
+    mocker.patch("builtins.print")
+    printyellow("Test")
+    print.assert_called_once_with("\033[93mTest\033[0m")
+
+
+#tests/__init__.py
+
+
+
