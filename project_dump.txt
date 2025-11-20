@@ -1518,7 +1518,9 @@ from src.job import Job
 from src.aihawk_easy_applier import AIHawkEasyApplier
 from loguru import logger
 import urllib.parse
-
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 class EnvironmentKeys:
     def __init__(self):
@@ -1730,38 +1732,50 @@ class AIHawkJobManager:
                     time.sleep(sleep_time)
                 page_sleep += 1
 
+    
+
     def get_jobs_from_page(self):
-
+        # 1. Optional: quick text-based “no jobs” check
         try:
-
-            no_jobs_element = self.driver.find_element(By.CLASS_NAME, 'jobs-search-two-pane__no-results-banner--expand')
-            if 'No matching jobs found' in no_jobs_element.text or 'unfortunately, things aren' in self.driver.page_source.lower():
+            body_text = self.driver.find_element(By.TAG_NAME, "body").text
+            if "No matching jobs found" in body_text or "No results found" in body_text:
                 logger.debug("No matching jobs found on this page, skipping.")
                 return []
-
-        except NoSuchElementException:
+        except Exception:
+            # If this fails for some reason, just continue normally
             pass
 
         try:
-            job_results = self.driver.find_element(By.CLASS_NAME, "jobs-search-results-list")
+            # 2. Wait for the results container – this class name has been stable
+            job_results = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "div.jobs-search-results-list")
+                )
+            )
+
+            # 3. Scroll to force lazy loading
             utils.scroll_slow(self.driver, job_results)
             utils.scroll_slow(self.driver, job_results, step=300, reverse=True)
 
-            job_list_elements = self.driver.find_elements(By.CLASS_NAME, 'scaffold-layout__list-container')[
-                0].find_elements(By.CLASS_NAME, 'jobs-search-results__list-item')
+            # 4. Select job list items by data-occludable-job-id, not by random class
+            job_list_elements = job_results.find_elements(
+                By.CSS_SELECTOR,
+                "li[data-occludable-job-id]"
+            )
+
             if not job_list_elements:
-                logger.debug("No job class elements found on page, skipping.")
+                logger.debug("No <li> elements with data-occludable-job-id found on page, skipping.")
                 return []
 
             return job_list_elements
 
         except NoSuchElementException:
-            logger.debug("No job results found on the page.")
+            logger.debug("No job results container found on the page.")
             return []
-
         except Exception as e:
             logger.error(f"Error while fetching job elements: {e}")
             return []
+
     def check_job_title(self,job_title: str) -> bool:
         # List of keywords to check for
         keywords = ["senior machine learning engineer", 

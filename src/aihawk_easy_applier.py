@@ -221,28 +221,47 @@ class AIHawkEasyApplier:
         raise Exception("No clickable 'Easy Apply' button found")
 
     def _get_job_description(self) -> str:
-        logger.debug("Getting job description")
-        try:
-            try:
-                see_more_button = self.driver.find_element(By.XPATH,
-                                                           '//button[@aria-label="Click to see more description"]')
-                actions = ActionChains(self.driver)
-                actions.move_to_element(see_more_button).click().perform()
-                time.sleep(2)
-            except NoSuchElementException:
-                logger.debug("See more button not found, skipping")
+        """
+        Grab the full job description text from the new LinkedIn job page.
 
-            description = self.driver.find_element(By.CLASS_NAME, 'jobs-description-content__text').text
-            logger.debug("Job description retrieved successfully")
+        Works with the structure:
+
+        <article class="jobs-description__container ...">
+        <div class="jobs-description__content ...">
+            <div class="jobs-box__html-content ... " id="job-details">...</div>
+        """
+        logger.debug("Getting job description")
+        wait = WebDriverWait(self.driver, 15)
+
+        try:
+            container = wait.until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "article.jobs-description__container")
+                )
+            )
+            html_content = container.find_element(
+                By.CSS_SELECTOR, "div.jobs-box__html-content#job-details"
+            )
+            description = html_content.text.strip()
+            logger.debug(
+                f"Job description length: {len(description)} characters"
+            )
             return description
-        except NoSuchElementException:
-            tb_str = traceback.format_exc()
-            logger.error(f"Job description not found: {tb_str}")
-            raise Exception(f"Job description not found: \nTraceback:\n{tb_str}")
-        except Exception:
-            tb_str = traceback.format_exc()
-            logger.error(f"Error getting Job description: {tb_str}")
-            raise Exception(f"Error getting Job description: \nTraceback:\n{tb_str}")
+        except Exception as e:
+            # last fallback – try any jobs-box__html-content on the page
+            try:
+                html_content = self.driver.find_element(
+                    By.CSS_SELECTOR, "div.jobs-box__html-content"
+                )
+                description = html_content.text.strip()
+                logger.debug(
+                    "Fallback job description grabbed "
+                    f"({len(description)} characters)"
+                )
+                return description
+            except Exception:
+                logger.error(f"Job description not found: {e}")
+                raise
 
     def _get_job_recruiter(self):
         logger.debug("Getting job recruiter information")
@@ -313,15 +332,33 @@ class AIHawkEasyApplier:
             logger.error(f"Form submission failed with errors: {error_elements}")
             raise Exception(f"Failed answering or file upload. {str([e.text for e in error_elements])}")
 
-    def _discard_application(self) -> None:
-        logger.debug("Discarding application")
+    def _discard_application(self):
+        logger.debug("Discarding application (closing Easy Apply modal)")
         try:
-            self.driver.find_element(By.CLASS_NAME, 'artdeco-modal__dismiss').click()
-            time.sleep(random.uniform(3, 5))
-            self.driver.find_elements(By.CLASS_NAME, 'artdeco-modal__confirm-dialog-btn')[0].click()
-            time.sleep(random.uniform(3, 5))
+            # Most reliable: data-test-modal-close-btn
+            close_btns = self.driver.find_elements(
+                By.CSS_SELECTOR, "button[data-test-modal-close-btn]"
+            )
+            if not close_btns:
+                # Fallback: generic .artdeco-modal__dismiss button
+                close_btns = self.driver.find_elements(
+                    By.CSS_SELECTOR, "button.artdeco-modal__dismiss"
+                )
+            if not close_btns:
+                # Last fallback: any button with aria-label='Dismiss' in the modal
+                close_btns = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "div.artdeco-modal button[aria-label='Dismiss']",
+                )
+
+            if close_btns:
+                close_btns[0].click()
+                logger.debug("Easy Apply modal dismissed")
+            else:
+                logger.warning("Could not find Easy Apply modal dismiss button")
         except Exception as e:
             logger.warning(f"Failed to discard application: {e}")
+
 
     def fill_up(self, job) -> None:
         logger.debug(f"Filling up form sections for job: {job}")

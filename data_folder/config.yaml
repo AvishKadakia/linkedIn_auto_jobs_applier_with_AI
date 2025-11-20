@@ -45,7 +45,7 @@ positions:
 
 locations:
   - Canada
-  - USA
+  # - USA
 
 apply_once_at_company: true
 

@@ -34,7 +34,7 @@ class OpenAIModel(AIModel):
     def __init__(self, api_key: str, llm_model: str):
         from langchain_openai import ChatOpenAI
         self.model = ChatOpenAI(model_name=llm_model, openai_api_key=api_key,
-                                temperature=0.4)
+                                temperature=1)
 
     def invoke(self, prompt: str) -> BaseMessage:
         logger.debug("Invoking OpenAI API")
@@ -46,7 +46,7 @@ class ClaudeModel(AIModel):
     def __init__(self, api_key: str, llm_model: str):
         from langchain_anthropic import ChatAnthropic
         self.model = ChatAnthropic(model=llm_model, api_key=api_key,
-                                   temperature=0.4)
+                                   temperature=1)
 
     def invoke(self, prompt: str) -> BaseMessage:
         response = self.model.invoke(prompt)
