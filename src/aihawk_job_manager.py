@@ -17,6 +17,9 @@ from app_config import MINIMUM_WAIT_TIME
 from src.aihawk_easy_applier import AIHawkEasyApplier
 from src.job import Job
 import urllib.parse
+class MaxApplicationsReached(Exception):
+    """Raised when the maximum number of successful applications for a run is reached."""
+    pass
 
 
 class EnvironmentKeys:
@@ -54,6 +57,7 @@ class AIHawkJobManager:
       • invoking AIHawkEasyApplier on Easy Apply jobs,
       • writing results to JSON files.
     """
+    MAX_SUCCESSFUL_APPLICATIONS = 29
 
     def __init__(self, driver):
         logger.debug("Initializing AIHawkJobManager")
@@ -62,10 +66,39 @@ class AIHawkJobManager:
         self.easy_applier_component = None
         self.env_config = EnvironmentKeys()
         logger.debug("AIHawkJobManager initialized successfully")
+        self.success_count = 0 
 
     # -------------------------------------------------------------------------
     # Dependency injection
     # -------------------------------------------------------------------------
+    def _reset_skipped_file(self):
+            """
+            For each run, remove any old skip/skipped file and create a fresh skipped.json.
+            Note: the rest of the code writes to 'skipped.json', so we normalize on that.
+            """
+            if not hasattr(self, "output_file_directory"):
+                return
+
+            # Clean up legacy names if they exist
+            for filename in ("skip.json", "skipped.json"):
+                file_path = self.output_file_directory / filename
+                try:
+                    if file_path.exists():
+                        file_path.unlink()
+                        logger.debug(f"Deleted old {filename} file at {file_path}")
+                except Exception as e:
+                    logger.debug(f"Could not delete {file_path}: {e}")
+
+            # Create a fresh skipped.json file for this run
+            try:
+                new_file = self.output_file_directory / "skipped.json"
+                with open(new_file, "w", encoding="utf-8") as f:
+                    json.dump([], f)
+                logger.debug(f"Created new skipped.json file for this run at {new_file}")
+            except Exception as e:
+                logger.error(
+                    f"Failed to create skipped.json in {self.output_file_directory}: {e}"
+                )
 
     def set_parameters(self, parameters):
         logger.debug("Setting parameters for AIHawkJobManager")
@@ -91,6 +124,10 @@ class AIHawkJobManager:
             self.resume_path = None
 
         self.output_file_directory = Path(parameters["outputFileDirectory"])
+        
+
+        self.success_count = 0
+        self._reset_skipped_file()
 
         logger.debug(
             "Parameters set successfully: "
@@ -333,10 +370,17 @@ class AIHawkJobManager:
 
                     try:
                         self.apply_jobs()
+                    except MaxApplicationsReached:
+                        logger.info(
+                            "Reached maximum successful applications. "
+                            "Stopping the job application loop."
+                        )
+                        return
                     except Exception as e:
                         logger.error(f"Error during job application: {e}")
                         # continue to next page / search
                         continue
+
 
                     logger.debug(
                         "Finished attempting applications for jobs on this page."
@@ -518,20 +562,68 @@ class AIHawkJobManager:
             job_list.append(Job(job_title, company, job_location, link, apply_method))
 
         for job in job_list:
+            # Stop if we've already reached the cap
+            if self.success_count >= self.MAX_SUCCESSFUL_APPLICATIONS:
+                logger.info(
+                    "Maximum successful applications reached "
+                    f"({self.MAX_SUCCESSFUL_APPLICATIONS}). Stopping further applications."
+                )
+                raise MaxApplicationsReached()
+
+            logger.debug(f"Considering job: {job.title} at {job.company}")
+
             if self.is_blacklisted(job.title, job.company, job.link):
+                logger.debug(f"Job blacklisted: {job.title} at {job.company}")
+                self.write_to_file(job, "skipped")
+                continue
+
+            if self.is_already_applied_to_job(job.title, job.company, job.link):
+                self.write_to_file(job, "skipped")
+                continue
+
+            if self.is_already_applied_to_company(job.company):
+                self.write_to_file(job, "skipped")
+                continue
+
+            # Only attempt Easy Apply jobs whose title passes keyword filter
+            if job.apply_method != "Easy Apply":
+                logger.debug(
+                    f"Not an Easy Apply job (apply_method={job.apply_method}) – skipping"
+                )
+                self.write_to_file(job, "skipped")
+                continue
+
+            if not self.check_job_title(job.title):
                 utils.printyellow(
-                    f"Blacklisted {job.title} at {job.company}, skipping..."
+                    f"Job title keywords didn't match for "
+                    f"{job.title} at {job.company}, skipping..."
                 )
                 self.write_to_file(job, "skipped")
                 continue
 
             try:
-                self.write_to_file(job, "data")
-            except Exception as e:
-                logger.error(
-                    f"Failed writing job data for {job.title} at {job.company}: {e}"
+                logger.debug(f"Attempting Easy Apply for {job.title} at {job.company}")
+                self.easy_applier_component.job_apply(job)
+                self.write_to_file(job, "success")
+
+                # NEW: increment success counter and maybe stop
+                self.success_count += 1
+                logger.debug(
+                    f"Successful applications this run: "
+                    f"{self.success_count}/{self.MAX_SUCCESSFUL_APPLICATIONS}"
                 )
+                if self.success_count >= self.MAX_SUCCESSFUL_APPLICATIONS:
+                    logger.info(
+                        "Reached maximum successful applications "
+                        f"({self.MAX_SUCCESSFUL_APPLICATIONS})."
+                    )
+                    raise MaxApplicationsReached()
+
+                logger.debug(f"Applied to job: {job.title} at {job.company}")
+            except Exception as e:
+                logger.error(f"Failed to apply for {job.title} at {job.company}: {e}")
                 self.write_to_file(job, "failed")
+
 
     def apply_jobs(self):
         """

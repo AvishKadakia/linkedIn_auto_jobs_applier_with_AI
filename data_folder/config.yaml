@@ -19,33 +19,47 @@ jobTypes:
 
 date:
   all time: false
-  month: true
+  month: false
   week: true
   24 hours: true
 
-positions:
-  - Senior Machine Learning Engineer
-  - Staff Machine Learning Engineer
-  - Machine Learning Engineer
-  - Senior AI Engineer
-  - Staff AI Engineer
-  - Senior LLM Engineer
-  - LLM Engineer
-  - Senior Generative AI Engineer
-  - Applied ML Engineer
-  - Applied ML / LLM Engineer
-  - Senior MLOps Engineer
-  - Staff MLOps Engineer
-  - Machine Learning Platform Engineer
-  - Senior ML Platform Engineer
-  - Senior Data Scientist, Machine Learning
-  - Senior Data Scientist, AI
-  - Senior Research Engineer, ML
-  - Senior Applied Scientist, Machine Learning
+# positions:
+#   - Senior Machine Learning Engineer
+#   - Staff Machine Learning Engineer
+#   - Machine Learning Engineer
+#   - Senior AI Engineer
+#   - Staff AI Engineer
+#   - Senior LLM Engineer
+#   - LLM Engineer
+#   - Senior Generative AI Engineer
+#   - Applied ML Engineer
+#   - Applied ML / LLM Engineer
+#   - Senior MLOps Engineer
+#   - Staff MLOps Engineer
+#   - Machine Learning Platform Engineer
+#   - Senior ML Platform Engineer
+#   - Senior Data Scientist, Machine Learning
+#   - Senior Data Scientist, AI
+#   - Senior Research Engineer, ML
+#   - Senior Applied Scientist, Machine Learning
+#   - Lead Machine Learning Engineer (often 50–70% IC + some people management)
+#   - Tech Lead, Machine Learning / AI (sometimes managing a small pod)
+#   - Head of Machine Learning
+#   - Head of MLOps / Head of ML Platform
+#   - Head of AI / ML Engineering
+#   - Senior Engineering Manager, Machine Learning
+#   - Senior Manager, AI / ML Platform
 
+positions:
+  - Senior MLOps
+  - Lead Machine Learning
+  - Databricks Architect
+  - Databricks Contractor
+  - Databricks Data Engineer
+  - Machine Learning Engineers
 locations:
   - Canada
-  # - USA
+ # - USA
 
 apply_once_at_company: true
 
